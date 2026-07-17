@@ -1,0 +1,21 @@
+# IDE
+.idea/
+.vscode/
+
+# CMake build directories
+build/
+build_test/
+cmake-build-*/
+CMakeFiles/
+
+# test files
+test/
+
+# Python
+__pycache__/
+.env/
+*.pyc
+*.pyd
+
+# AI assistant
+.superpowers/
