@@ -2,6 +2,8 @@ import logging
 
 from balanceApi import *
 from tools import *
+from mcp import Client, StdioServerParameters
+import asyncio
 
 logging.basicConfig(
     level=logging.INFO,
@@ -10,6 +12,103 @@ logging.basicConfig(
 )
 
 TEST_USR_ID = "8f3c1a7d6b2e4f90a5c8d1e7b3f6492c"
+
+async def load_mcp_tools(mcp_client):
+    result = await mcp_client.list_tools()
+
+    tools = []
+
+    for tool in result.tools:
+        tools.append({
+            "type": "function",
+            "name": tool.name,
+            "description": tool.description or "",
+            "parameters": tool.input_schema,
+        })
+
+    return tools
+
+
+async def run_agent(
+    openai_client,
+    mcp_client,
+    input_msg: str,
+):
+    context = [
+        {
+            "role": "user",
+            "content": input_msg,
+        }
+    ]
+    tools = await load_mcp_tools(mcp_client)
+
+    response = openai_client.responses.create(
+        model="deepseek-v4-flash",
+        input=context,
+        tools=tools,
+        stream=False,
+        extra_body={
+            "thinking": {"type": "enabled"},
+            "user_id": TEST_USR_ID
+        }
+    )
+
+    while True:
+        tool_calls = [
+            item
+            for item in response.output
+            if item.type == "function_call"
+        ]
+
+        if not tool_calls:
+            return response.output_text
+
+        context.extend(response.output)
+
+        for call in tool_calls:
+            args = json.loads(call.arguments)
+            result = await mcp_client.call_tool(
+                call.name,
+                args,
+            )
+            context.append({
+                "type": "function_call_output",
+                "call_id": call.call_id,
+                "output": str(result),
+            })
+
+        response = openai_client.responses.create(
+            model="deepseek-v4-flash",
+            input=context,
+            tools=tools,
+            stream=False,
+            extra_body={
+                "thinking": {"type": "enabled"},
+                "user_id": TEST_USR_ID
+            }
+        )
+
+local_mcp_server = StdioServerParameters(
+    command="python",
+    args=[
+        "/home/xumaozhou/Music/harnessPrototype/MCPServer/server.py",
+    ],
+)
+openai_client = OpenAI(
+        api_key=os.environ.get('DEEPSEEK_API_KEY'),
+        base_url="https://api.deepseek.com")
+
+async def main():
+
+    async with Client(local_mcp_server) as mcp_client:
+
+        answer = await run_agent(
+            openai_client,
+            mcp_client,
+            "根据标注平台任务id 41496 查询对应的入库任务id，并给出hdfs存储地址",
+        )
+
+        print(answer)
 
 
 def testAgentTools():
@@ -138,5 +237,6 @@ def testReflection():
 
 if __name__ == "__main__":
     logging.info("---------------------> START <---------------------")
-    testReflection()
+    asyncio.run(main())
+    # testReflection()
     # testAgentTools()
