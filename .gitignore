@@ -18,5 +18,8 @@ __pycache__/
 *.pyc
 *.pyd
 
+# MCP tool result cache
+.mcp_result_cache/
+
 # AI assistant
 .superpowers/

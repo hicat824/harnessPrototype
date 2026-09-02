@@ -5,6 +5,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 
 from httpUtil import HttpRequestError, httpReqWithJsonResp
+from resultCache import project_and_cache
 
 __all__ = [
     "csKtsShowByTaskId",
@@ -142,17 +143,18 @@ def csKtsInvokeQuery(
       当用户给出中文流程名（如“bev作业任务资料生成”）时，应先映射为对应 engineCode 再调用。
     - task_id：全数字的任务 id。
 
-    返回的 JobInfo 常用字段：
-    - params：流程控制参数列表。字段随 engineCode 不同而变化，每项为 {"k": "...", "v": "..."}。
-    - taskSeq：全字母的任务 id，可继续用于 csKtsShowByTaskSeq。
-    - tasks：任务信息列表。每个元素是一个 taskInfo object。
-      taskInfo 中的任务参数位于 params，同样采用 kv 格式，不同类型任务的字段不同，例如：
-      {"k": "trackIds", "v": "kk1qHc_1782269748200"}
+    返回 {items, cache}。items 通常只有一条，只含：
+    - taskSeq：全字母的任务 id，可继续用于 csKtsShowByTaskSeq
+    - name：环节名称，对应 engineCode
+    - taskBusinessId：数字 taskId
+    - bizCode：业务编码
+    - params_keys：流程控制参数的 k 列表，不含 v
+    - tasks：精简后的 taskInfo，每项含 taskId 和 params_keys（来自 input.params 的 k 列表）
 
-    读取 params / tasks[].params 时：
-    1. 按 k 精确匹配用户需要的字段；
-    2. 不要凭空推断不存在的字段；
-    3. 多个候选字段无法确定时，应向用户说明，而不是自行猜测。
+    完整 JobInfo（含 params 的 v、tasks[].input.params）已落盘，路径在 cache[].path。
+    需要具体参数时调用 readCachedResult(path, json_path)，
+    例如 params.directParam-up-image-version 或 tasks.0.input.params.trackIds。
+    读取 params 时按 k 精确匹配，不要凭空推断不存在的字段。
     """
     parsed_engine = _require_non_empty("engine_code", engine_code)
     parsed_id = _parse_task_id(task_id)
@@ -174,7 +176,11 @@ def csKtsInvokeQuery(
             f"invoke/query returned invalid JobInfo for engine_code={parsed_engine!r}, "
             f"task_id={parsed_id}: {response!r}"
         )
-    return response
+    return project_and_cache(
+        "invoke_query",
+        response,
+        f"engine_code={parsed_engine!r}, task_id={parsed_id}",
+    )
 
 
 def csKtsInsertOrUpdateTags(

@@ -5,6 +5,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 
 from httpUtil import HttpRequestError, httpReqWithJsonResp
+from resultCache import project_and_cache
 
 __all__ = [
     "kdMaterialQueryTrack",
@@ -42,21 +43,19 @@ def kdMaterialQueryTrack(
         str,
         Field(description="轨迹 id，例如 kk1imK_1785211909114。通常 trackId.split('_')[0] 为对应入库任务的 taskSeq"),
     ],
-) -> list:
+) -> dict:
     """
     查询已经入库轨迹的信息。
 
-    返回值为 tracks 列表。空列表表示该轨迹没有成功入库过。
-    列表中每个对象对应该轨迹在某个 pose 库下的轨迹信息，常用字段：
-    - verTimestamps：当前 pose 库中轨迹的版本号，毫秒时间戳
-    - taskId：对应入库任务的 taskSeq
-    - poseTag：对应 pose 库名称
-    - geometry：WKT 格式的轨迹形态
+    返回 {items, cache}。items 为空列表表示该轨迹没有成功入库过。
+    items 中每条只含：
+    - poseTag：pose 库名称
     - totalMileage：轨迹总长度
-    - otherFiles：HDFS 杂项数据存放目录，其上一级即为对应入库数据 HDFS 存储根目录
-    - previousTrackId：同一批数据下前一个轨迹 id，允许为空
-    - nextTrackId：同一批数据下后一个轨迹 id，允许为空
-    - sourceTag：轨迹来源标识
+    - taskId：对应入库任务的 taskSeq
+
+    其余字段（geometry、otherFiles、verTimestamps、previousTrackId、nextTrackId、sourceTag 等）
+    已按 {trackId}_{poseTag}.json 落盘，路径在 cache[].path。
+    需要详情时调用 readCachedResult(path, json_path)，例如 otherFiles、geometry。
 
     通常 trackId.split('_')[0] 为对应入库任务的 taskSeq。
     """
@@ -69,4 +68,20 @@ def kdMaterialQueryTrack(
         raise ToolError(
             f"failed to query track for track_id={parsed_track_id!r}: {exc}"
         ) from exc
-    return _extract_tracks(payload, parsed_track_id)
+    tracks = _extract_tracks(payload, parsed_track_id)
+    normalized: list[dict] = []
+    for index, track in enumerate(tracks):
+        if not isinstance(track, dict):
+            raise ToolError(
+                f"queryTrack item is not an object for track_id={parsed_track_id!r}[{index}]: "
+                f"{type(track).__name__}"
+            )
+        if "trackId" not in track:
+            track = dict(track)
+            track["trackId"] = parsed_track_id
+        normalized.append(track)
+    return project_and_cache(
+        "query_tracks",
+        normalized,
+        f"track_id={parsed_track_id}",
+    )

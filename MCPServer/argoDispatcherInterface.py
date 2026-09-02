@@ -5,6 +5,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 
 from httpUtil import HttpRequestError, httpReqWithJsonResp
+from resultCache import project_and_cache
 
 __all__ = [
     "csArgoFindDomainsByTaskSeq",
@@ -41,39 +42,39 @@ def _extract_job_list(payload: Any, identifier: str) -> list:
     )
 
 
-def _find_domains(path: str, query: dict, identifier: str) -> list:
+def _find_domains(path: str, query: dict, identifier: str) -> dict:
     url = f"{_CS_ARGO_URL}/job/{path}?{urlencode(query)}"
     try:
         payload = httpReqWithJsonResp(url)
     except HttpRequestError as exc:
         raise ToolError(f"failed to query job domains for {identifier}: {exc}") from exc
-    return _extract_job_list(payload, identifier)
+    jobs = _extract_job_list(payload, identifier)
+    return project_and_cache("find_domains", jobs, identifier)
 
 
 def csArgoFindDomainsByTaskSeq(
     task_seq: Annotated[str, Field(description="全字母的任务 id，例如 kk1imK")],
-) -> list:
+) -> dict:
     """
     通过字母 taskSeq 查询该任务各个环节的运行信息。
 
     对同一个任务，返回信息与 csArgoFindDomainsByTaskId 一致。
     taskId 是全数字任务 id，taskSeq 是全字母任务 id。
 
-    返回值为 JobInfo 列表。engineCode 使用公司统一的 engineCode 编码体系。
-    如果当前请求已经明确目标流程，优先选择 obj["engineCode"] 精确匹配目标流程的对象；
+    返回 {items, cache}。engineCode 使用公司统一的 engineCode 编码体系。
+    如果当前请求已经明确目标流程，优先选择 items 中 obj["engineCode"] 精确匹配的对象；
     列表中没有目标 engineCode 时说明未找到对应环节，不要按数组顺序猜测。
 
-    每个 JobInfo 需要关注的字段：
+    items 中每个 Job 只含：
     - taskBusinessId：对应 Job 的 taskId
     - taskSeq：对应 Job 的 taskSeq
     - engineCode：对应环节的 engineCode
-    - state：任务状态。"0" 表示排队，"1" 表示运行中，"4" 表示运行失败，"9" 表示运行成功，其他取值表示任务异常
-    - tasks：该 Job 包含的 Task 列表，每个 taskInfo 常用字段：
-        - state：任务状态，含义同上
-        - podName：k8s 中的 pod name，可用于查询 pod 日志
-        - workflowName：k8s 中的 workflowName，可用于查询日志
-        - stateAt：任务开始时间，毫秒时间戳
-        - params：任务参数，不同任务可能不一样，字段定义与 csKtsShowByTaskId 返回的 tags 一致
+    - state：任务状态。"0" 排队，"1" 运行中，"4" 运行失败，"9" 运行成功，其他取值表示任务异常
+    - tasks：精简后的 Task 列表，每项含 state、podName、workflowName、stateAt，以及 params_keys（不含值）
+
+    完整 JobInfo（含 tasks[].params）按 {taskSeq}_{engineCode}.json 落盘，路径在 cache[].path。
+    需要 params 或其他字段时调用 readCachedResult(path, json_path)，
+    例如 tasks.0.params 或 tasks.0.params.lidarFiles。
     """
     parsed_seq = _require_non_empty("task_seq", task_seq)
     return _find_domains(
@@ -85,28 +86,27 @@ def csArgoFindDomainsByTaskSeq(
 
 def csArgoFindDomainsByTaskId(
     task_id: Annotated[str, Field(description="全数字的任务 id，例如 410460")],
-) -> list:
+) -> dict:
     """
     通过数字 taskId 查询该任务各个环节的运行信息。
 
     对同一个任务，返回信息与 csArgoFindDomainsByTaskSeq 一致。
     taskId 是全数字任务 id，taskSeq 是全字母任务 id。
 
-    返回值为 JobInfo 列表。engineCode 使用公司统一的 engineCode 编码体系。
-    如果当前请求已经明确目标流程，优先选择 obj["engineCode"] 精确匹配目标流程的对象；
+    返回 {items, cache}。engineCode 使用公司统一的 engineCode 编码体系。
+    如果当前请求已经明确目标流程，优先选择 items 中 obj["engineCode"] 精确匹配的对象；
     列表中没有目标 engineCode 时说明未找到对应环节，不要按数组顺序猜测。
 
-    每个 JobInfo 需要关注的字段：
+    items 中每个 Job 只含：
     - taskBusinessId：对应 Job 的 taskId
     - taskSeq：对应 Job 的 taskSeq
     - engineCode：对应环节的 engineCode
-    - state：任务状态。"0" 表示排队，"1" 表示运行中，"4" 表示运行失败，"9" 表示运行成功，其他取值表示任务异常
-    - tasks：该 Job 包含的 Task 列表，每个 taskInfo 常用字段：
-        - state：任务状态，含义同上
-        - podName：k8s 中的 pod name，可用于查询 pod 日志
-        - workflowName：k8s 中的 workflowName，可用于查询日志
-        - stateAt：任务开始时间，毫秒时间戳
-        - params：任务参数，不同任务可能不一样，字段定义与 csKtsShowByTaskId 返回的 tags 一致
+    - state：任务状态。"0" 排队，"1" 运行中，"4" 运行失败，"9" 运行成功，其他取值表示任务异常
+    - tasks：精简后的 Task 列表，每项含 state、podName、workflowName、stateAt，以及 params_keys（不含值）
+
+    完整 JobInfo（含 tasks[].params）按 {taskSeq}_{engineCode}.json 落盘，路径在 cache[].path。
+    需要 params 或其他字段时调用 readCachedResult(path, json_path)，
+    例如 tasks.0.params 或 tasks.0.params.lidarFiles。
     """
     parsed_id = _parse_positive_int("task_id", task_id)
     return _find_domains(
