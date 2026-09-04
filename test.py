@@ -1,11 +1,12 @@
-import logging
-from agentCore.agentCore import *
 import asyncio
+import logging
+
+from agentCore.agentCore import agentLite
 
 logging.basicConfig(
     level=logging.INFO,
-    format='[%(asctime)s] >>> %(message)s',
-    datefmt='%Y/%m/%d %H:%M'
+    format="[%(asctime)s] >>> %(message)s",
+    datefmt="%Y/%m/%d %H:%M",
 )
 
 
@@ -18,5 +19,6 @@ if __name__ == "__main__":
             logging.fatal("Exiting...")
             break
 
-        logging.info(f'input_msg: {input_msg}')
-        asyncio.run(agent.callLLM(input_msg=input_msg))
+        logging.info("input_msg: %s", input_msg)
+        answer = asyncio.run(agent.callLLM(input_msg=input_msg))
+        logging.debug("callLLM returned %s chars", len(answer))

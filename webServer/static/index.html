@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>harnessPrototype</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main class="app">
+    <header class="header">
+      <h1>harnessPrototype</h1>
+      <p class="subtitle">每一条消息都是独立问答</p>
+      <p id="status" class="status" hidden></p>
+    </header>
+    <section id="log" class="log" aria-live="polite"></section>
+    <form id="chat-form" class="composer">
+      <textarea
+        id="message"
+        name="message"
+        rows="3"
+        placeholder="输入一条独立问题，例如任务查询，或 /balance"
+        disabled
+      ></textarea>
+      <button id="send" type="submit" disabled>发送</button>
+    </form>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
