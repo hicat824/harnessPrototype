@@ -1,22 +1,25 @@
 import os, sys
 import asyncio
 from agents import (
-Agent,
-Runner,
-OpenAIChatCompletionsModel,
-OpenAIResponsesModel,
-set_tracing_disabled,
-SQLiteSession,
-trace,
-handoff,
+    Agent,
+    Runner,
+    OpenAIChatCompletionsModel,
+    OpenAIResponsesModel,
+    set_tracing_disabled,
+    SQLiteSession,
+    trace,
+    handoff, RunContextWrapper, TContext, Tool,
 )
+from agents.lifecycle import TAgent
 from agents.mcp import MCPServerStdio
 from agents.realtime import handoffs
 from openai import AsyncOpenAI
 from tools import *
 import openai
+import uuid
+from agents import AgentHooks
+from agents.tool_context import ToolContext
 from agents.exceptions import ModelTimeoutError
-
 
 PYTHON_EXPERT_DESCRIPTION = """
 Python 专业开发 Agent，负责处理所有 Python 代码相关任务。
@@ -87,11 +90,11 @@ PYTHON_EXPERT_INSTRUCTIONS = """
 1. 问题原因或任务处理结果。
 2. 修改的文件及主要修改内容（如有）。
 3. 实际执行的测试及结果（如有）。
-4. 未解决的问题或需要用户确认的事项。
+4. 未解决的问题或需要用户确认的事项（如有）。
+5. 本轮是否已经完成问题修复。
 
 不输出无关的中间推理过程。
 """
-
 
 CPP_EXPERT_DESCRIPTION = """
 C++ 专业开发 Agent，负责处理所有 C++ 代码相关任务。
@@ -180,11 +183,73 @@ CPP_EXPERT_INSTRUCTIONS = """
 1. 问题原因或任务处理结果。
 2. 修改的文件及主要修改内容（如有）。
 3. 编译和测试结果（如有）。
-4. 未解决的问题或需要用户确认的事项。
+4. 未解决的问题或需要用户确认的事项（如有）。
+5. 本轮是否已经完成问题修复。
 
 不输出无关的中间推理过程。
 """
 
+
+class supervisorHooks(AgentHooks):
+    async def on_tool_start(
+            self,
+            context: RunContextWrapper[TContext],
+            agent: TAgent,
+            tool: Tool,
+    ) -> None:
+        call_id = (
+            context.tool_call_id
+            if isinstance(context, ToolContext)
+            else "unknown"
+        )
+        arguments = (
+            context.tool_arguments
+            if isinstance(context, ToolContext)
+            else ""
+        )
+
+        print(
+            f"[Supervisor] 开始调用 {tool.name}, "
+            f"call_id={call_id}, arguments={arguments}"
+        )
+
+    async def on_tool_end(
+            self,
+            context: RunContextWrapper[TContext],
+            agent: TAgent,
+            tool: Tool,
+            result: object,
+    ) -> None:
+        call_id = (
+            context.tool_call_id
+            if isinstance(context, ToolContext)
+            else "unknown"
+        )
+        arguments = (
+            context.tool_arguments
+            if isinstance(context, ToolContext)
+            else ""
+        )
+
+        print(
+            f"[Supervisor] {tool.name} 调用结束, "
+            f"call_id={call_id}, arguments={arguments}"
+        )
+
+
+class localAgentHooks(AgentHooks):
+    async def on_start(self, context, agent):
+        print(f"[{agent.name}] 开始运行")
+
+    async def on_end(self, context, agent, output):
+        output_text = str(output)
+        if len(output_text) > 2000:
+            output_text = output_text[:2000] + "...[truncated]"
+
+        print(
+            f"[{agent.name}] 运行结束, "
+            f"output={output_text}"
+        )
 
 
 class AgentLite:
@@ -197,19 +262,21 @@ class AgentLite:
             readFile,
             listFiles,
             applyPatch,
-            runTest
+            runSafeTest
         ]
         # self._client = self._initDSClient()
         self._thread_id = os.environ["THREAD_ID"]
-        self._session = SQLiteSession("testSession", "/media/xumaozhou/data/AI/local_agent_test/session.db")
+        self._session_id = "testSession"
+        self._session = SQLiteSession(self._session_id, "/media/xumaozhou/data/AI/local_agent_test/session.db")
 
     async def initDSClientWithMCP(self):
+        self._session_id = f'session_{uuid.uuid4().hex[:12]}'
         # init mcp server loop
         self._mcp_server = MCPServerStdio(
-                params={
-                    "command": "python",
-                    "args": ["/home/xumaozhou/Music/harnessPrototype/mcpServer.py"],
-                }
+            params={
+                "command": "python",
+                "args": ["/home/xumaozhou/Music/harnessPrototype/mcpServer.py"],
+            }
         )
         # 手动进入 async context
         await self._mcp_server.__aenter__()
@@ -234,12 +301,13 @@ class AgentLite:
 
         # test multi agent
         self._python_agent = Agent(
-                name="PythonExpert",
-                instructions=PYTHON_EXPERT_INSTRUCTIONS,
-                model=model,
-                tools=self._tools,
-                mcp_servers=[self._mcp_server],
-            )
+            name="PythonExpert",
+            instructions=PYTHON_EXPERT_INSTRUCTIONS,
+            model=model,
+            tools=self._tools,
+            mcp_servers=[self._mcp_server],
+            hooks=localAgentHooks(),
+        )
 
         self._cpp_agent = Agent(
             name="CppExpert",
@@ -247,8 +315,8 @@ class AgentLite:
             model=model,
             tools=self._tools,
             mcp_servers=[self._mcp_server],
+            hooks=localAgentHooks(),
         )
-
 
         self._client = Agent(
             name="Supervisor",
@@ -271,8 +339,8 @@ class AgentLite:
             C++ 相关任务委派给 CppExpert。
             同时涉及两种语言时，分别调用对应专家。
             
-            你只负责分配任务和汇总结果，不自行读取、
-            修改或测试代码。
+            你只负责分配任务和汇总结果，不自行读取、修改或测试代码。
+            如果已经完成修改，直接输出修改结论。
             
             只输出中文最终结论。
             """,
@@ -286,16 +354,36 @@ class AgentLite:
                     tool_description=CPP_EXPERT_DESCRIPTION
                 ),
             ],
-            mcp_servers = [self._mcp_server],
-            )
-
+            mcp_servers=[self._mcp_server],
+            hooks=supervisorHooks()
+        )
 
     async def close(self):
         if self._mcp_server is not None:
             await self._mcp_server.__aexit__(None, None, None)
 
+    async def simpleCallLLM(self, prompt: str):
+        with trace(workflow_name="Conversation", group_id=self._thread_id):
+            try:
+                response = await Runner.run(self._client, prompt, session=self._session)
+                print(f"answer = {response.final_output}")
 
-    async def callLLMWithMcpServer(self) -> str:
+                usage = response.context_wrapper.usage
+                print("请求次数:", usage.requests)
+                print("输入 Token:", usage.input_tokens)
+                print("输出 Token:", usage.output_tokens)
+                print("总 Token:", usage.total_tokens)
+                return True
+            except ModelTimeoutError as e:
+                print("Agents SDK 模型超时:", e)
+
+            except openai.APITimeoutError as e:
+                print("OpenAI SDK HTTP超时:", e)
+                print("底层异常:", repr(e.__cause__))
+
+        return False
+
+    async def callLLMWithMcpServer(self):
         with trace(workflow_name="Conversation", group_id=self._thread_id):
             while True:
                 prompt = input()
@@ -322,7 +410,6 @@ class AgentLite:
                     print("OpenAI SDK HTTP超时:", e)
                     print("底层异常:", repr(e.__cause__))
 
-
     def _initDSClient(self):
         # 1. 配置 DeepSeek 客户端
         client = AsyncOpenAI(
@@ -345,7 +432,6 @@ class AgentLite:
 
         return agent
 
-
     def callLLMWithLocalSession(self) -> str:
         with trace(workflow_name="Conversation", group_id=self._thread_id):
             while True:
@@ -355,7 +441,6 @@ class AgentLite:
 
                 response = Runner.run_sync(self._client, prompt, session=self._session)
                 print(response.final_output)
-
 
     def callLLMWithPreRespId(self) -> str:
         """
@@ -367,6 +452,7 @@ class AgentLite:
             if prompt == "/exit":
                 return "退出对话"
 
-            response = Runner.run_sync(self._client, prompt, previous_response_id=previous_response_id, auto_previous_response_id=True)
+            response = Runner.run_sync(self._client, prompt, previous_response_id=previous_response_id,
+                                       auto_previous_response_id=True)
             previous_response_id = response.last_response_id
             print(response.final_output)

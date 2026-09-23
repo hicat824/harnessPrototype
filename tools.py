@@ -1,9 +1,12 @@
 import os
+import shutil
 import sys
 import json
 from pathlib import Path
 import subprocess
 import re
+import uuid
+import tempfile
 
 from agents.decorators import tool
 
@@ -11,7 +14,7 @@ __all__ = [
     "readFile",
     "listFiles",
     "writeFile",
-    "runTest",
+    "runSafeTest",
     "applyPatch",
 ]
 
@@ -63,6 +66,23 @@ def writeFile(path: str, content: str) -> None:
     with open(path, "w", encoding='utf-8') as fp:
         fp.write(content)
     print(f'成功输出内容到 {path}')
+
+
+@tool
+def copyFile(source: str, target: str) -> bool:
+    """
+    用于复制文件到指定路径
+
+    输入参数：
+        source: 来源文件绝对路径，比如: /workspace/A/test.txt
+        target: 目标文件绝对路径，比如: /workspace/B/test.txt
+    """
+    try:
+        shutil.copyfile(source, target)
+        print(f'成功复制文件到{target}')
+        return True
+    except Exception as e:
+        raise IOError(f"复制文件报错： {e}")
 
 
 @tool
@@ -213,10 +233,10 @@ def applyPatch(patch: str, workspace: str) -> dict:
 
 
 @tool
-def runTest(path: str) -> dict:
+def runSafeTest(project_path: str, test_path: str) -> dict:
     """
-    执行当前 Python 项目的 pytest 测试，验证代码是否正确。
-    默认 pytest 文件与待测试代码处于同一个目录下。
+    在临时 Docker 容器中执行 pytest 验证代码改动是否正确。
+    每次调用创建一个新容器，执行完成后自动删除。
 
     使用场景：
     1. 修复 Bug 或修改代码后，调用本工具验证修改结果。
@@ -225,40 +245,126 @@ def runTest(path: str) -> dict:
     4. 未发现测试用例时，不得认为测试通过。
 
     输入：
-        path: 待测试代码所在文件夹绝对路径
+        project_path: 被测试源码目录
+        test_path: pytest 测试目录
 
     返回：
         status: passed、failed 或 no_tests
         success: 是否测试通过
+        exit_code: 返回码
         output: pytest 的测试输出及错误信息
-
-    注意：本工具只负责执行测试，不负责修改代码。
     """
-    if not _check_path(path):
-        raise PermissionError(f"禁止访问工作目录之外的路径: {path}")
+    if not _check_path(project_path):
+        raise PermissionError(f"禁止访问工作目录之外的路径: {project_path}")
 
-    result = subprocess.run(
-        [sys.executable, "-m", "pytest", str(path), "-q"],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
+    project = Path(project_path).resolve()
+    tests = Path(test_path).resolve()
 
-    # 根据 pytest 返回码判断测试状态
-    if result.returncode == 0:
-        status = "passed"
+    if not project.is_dir() or not tests.is_dir():
+        return {
+            "status": "error",
+            "success": False,
+            "exit_code": None,
+            "output": "源码目录或测试目录不存在",
+        }
 
-    elif result.returncode == 5:
-        status = "no_tests"
+    # 为每次测试生成唯一容器名称
+    container_name = f"agent-test-{uuid.uuid4().hex[:12]}"
 
+    command = [
+        "docker", "run", "--rm",
+        "--name", container_name,
+
+        # 基础隔离
+        "--network", "none",
+        "--user", "1000:1000",
+        "--cap-drop", "ALL", # 移除 Linux 特权能力
+        "--security-opt", "no-new-privileges", # 禁止获取新的特权
+        "--memory", "512m",
+        "--cpus", "1",
+        "--pids-limit", "128",
+        "--read-only",
+
+        # 为 pytest 提供临时写入空间
+        "--tmpfs", "/tmp:rw,nosuid,nodev,size=64m,mode=1777",
+
+        # 源码和固定测试均为只读
+        "--mount", f"type=bind,src={project},dst=/workspace,readonly",
+        "--mount", f"type=bind,src={tests},dst=/tests",
+
+        # 工作目录及 Python 导入路径
+        "-w", "/workspace",
+        "-e", "PYTHONPATH=/workspace",
+        "-e", "PYTHONDONTWRITEBYTECODE=1",
+        "-e", "HOME=/tmp",
+
+        # Docker 镜像
+        "agent-python:3.10",
+
+        # 容器内执行的 pytest 命令
+        "python", "-m", "pytest",
+        "/tests",
+        "-q",
+        "-x",
+        "--tb=short",
+        "-p", "no:cacheprovider",
+    ]
+    print(f'执行测试, dokcer: {container_name}')
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        print('测试通过')
+
+    except subprocess.TimeoutExpired:
+        # 超时时强制删除容器，避免测试进程残留
+        subprocess.run(
+            ["docker", "rm", "-f", container_name],
+            capture_output=True,
+            timeout=15,
+        )
+
+        return {
+            "status": "timeout",
+            "success": False,
+            "exit_code": None,
+            "output": "测试执行超时（60 秒）",
+        }
+
+    except OSError as exc:
+        return {
+            "status": "error",
+            "success": False,
+            "exit_code": None,
+            "output": str(exc),
+        }
+
+        # 根据 pytest 退出码判断结果
+        # Docker 自身启动失败也可能返回非零退出码
+    status_map = {
+        0: "passed",
+        1: "failed",
+        2: "interrupted",
+        3: "internal_error",
+        4: "usage_error",
+        5: "no_tests",
+    }
+
+    if result.returncode in (125, 126, 127):
+        status = "execution_error"
     else:
-        status = "failed"
+        status = status_map.get(
+            result.returncode,
+            "execution_error",
+        )
 
-    test_result = {
+    return {
         "status": status,
         "success": status == "passed",
+        "exit_code": result.returncode,
         "output": result.stdout + result.stderr,
     }
-    print(f'测试结果： {test_result}')
-
-    return test_result
