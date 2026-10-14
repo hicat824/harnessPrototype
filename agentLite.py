@@ -14,7 +14,10 @@ from agents.lifecycle import TAgent
 from agents.mcp import MCPServerStdio
 from agents.realtime import handoffs
 from openai import AsyncOpenAI
-from tools import EvalContext, FatalToolError, readFile, listFiles, applyPatch, runSafeTest
+from tools import (
+    EvalContext, FatalToolError, readFile, searchFile, readFileRange,
+    listFiles, applyPatch, runSafeTest, limit_expert_output,
+)
 from agentPrompts import (
     SUPERVISOR_INSTRUCTIONS,
     LOCAL_AGENT_INSTRUCTIONS,
@@ -93,6 +96,15 @@ class localAgentHooks(AgentHooks):
         )
 
 
+async def _limited_expert_output(run_result):
+    """在专家结论成为 Supervisor 工具结果前限长，控制台 Hook 仅负责打印。"""
+    return limit_expert_output(
+        run_result.context_wrapper.context,
+        run_result.final_output,
+        run_result.last_agent.name,
+    )
+
+
 class AgentLite:
     def __init__(self):
         self._client = None
@@ -101,6 +113,8 @@ class AgentLite:
         self._cpp_agent = None
         self._tools = [
             readFile,
+            searchFile,
+            readFileRange,
             listFiles,
             applyPatch,
             runSafeTest
@@ -168,11 +182,15 @@ class AgentLite:
                     tool_name="PythonExpert",
                     tool_description=PYTHON_EXPERT_DESCRIPTION,
                     failure_error_function=None,
+                    custom_output_extractor=_limited_expert_output,
+                    session=self._session
                 ),
                 self._cpp_agent.as_tool(
                     tool_name="CppExpert",
                     tool_description=CPP_EXPERT_DESCRIPTION,
                     failure_error_function=None,
+                    custom_output_extractor=_limited_expert_output,
+                    session=self._session
                 ),
             ],
             mcp_servers=[self._mcp_server],
@@ -258,7 +276,7 @@ class AgentLite:
             name="testAgent",
             instructions=LOCAL_AGENT_INSTRUCTIONS,
             model=model,
-            tools=[readFile, listFiles],
+            tools=[readFile, searchFile, readFileRange, listFiles],
         )
 
         return agent

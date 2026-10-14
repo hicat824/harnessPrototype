@@ -14,6 +14,8 @@ from agents.exceptions import AgentsException
 
 __all__ = [
     "readFile",
+    "searchFile",
+    "readFileRange",
     "listFiles",
     "writeFile",
     "runSafeTest",
@@ -24,6 +26,12 @@ __all__ = [
 
 _SAFE_WORKSPACE = Path("/media/xumaozhou/data/AI/local_agent_test").resolve()
 _MAX_FAILURE_COUNT = 2
+# 这是字符预算，不是模型 Token 上限；计入完整 JSON 响应。
+_MAX_TOOL_RESULT_CHARS = 2000
+_MAX_PAGE_ITEMS = 100
+_MAX_RANGE_LINES = 200
+_MAX_MATCH_EXCERPT_CHARS = 160
+_MAX_ERROR_MESSAGE_CHARS = 120
 
 
 # 1. 定义致命工具异常
@@ -65,12 +73,172 @@ def _retryable_error(state: EvalContext, tool_name: str, error_code: str,
     state.failure_counts[key] = count
     if count >= _MAX_FAILURE_COUNT:
         raise FatalToolError(f"{error_code}_LIMIT: {message}")
-    return {
+    result = {
         "success": False,
         "error_code": error_code,
         "retryable": True,
-        "message": message,
+        "message": message[:_MAX_ERROR_MESSAGE_CHARS],
     }
+    if len(message) > _MAX_ERROR_MESSAGE_CHARS:
+        result["truncated"] = True
+    return result
+
+
+def _serialize_result(result: dict) -> str:
+    """统一返回 JSON 字符串，避免 SDK 再将字典转成 Python repr。"""
+    return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+
+
+def _limit_text_result(result: dict, text_key: str = "excerpt",
+                       keep_tail: bool = False) -> dict:
+    """缩短正文，保留状态和来源；用二分查找计入转义后的 JSON 长度。"""
+    result = dict(result)
+    if len(_serialize_result(result)) <= _MAX_TOOL_RESULT_CHARS:
+        return result
+    text = result[text_key]
+    result["truncated"] = True
+    if "complete" in result:
+        result["complete"] = False
+    result[text_key] = ""
+    if len(_serialize_result(result)) > _MAX_TOOL_RESULT_CHARS:
+        raise FatalToolError("RESULT_TOO_LARGE: 结果元数据超出预算，请缩短来源路径")
+
+    low, high = 0, len(text)
+    while low < high:
+        size = (low + high + 1) // 2
+        if keep_tail and size > 0:
+            head_size = size // 3
+            tail_size = size - head_size
+            result[text_key] = text[:head_size] + "\n...[truncated]...\n" + text[-tail_size:]
+        else:
+            result[text_key] = text[:size]
+        if len(_serialize_result(result)) <= _MAX_TOOL_RESULT_CHARS:
+            low = size
+        else:
+            high = size - 1
+    if keep_tail and low > 0:
+        head_size = low // 3
+        result[text_key] = text[:head_size] + "\n...[truncated]...\n" + text[-(low - head_size):]
+    else:
+        result[text_key] = text[:low]
+    return result
+
+
+def _limit_page_result(result: dict, entries_key: str, offset: int,
+                       total: int) -> str:
+    """整项裁剪列表并更新分页位置，不把文件路径或命中记录从中间切断。"""
+    entries = result[entries_key]
+    while True:
+        has_more = offset + len(entries) < total
+        result["has_more"] = has_more
+        result["next_offset"] = offset + len(entries) if has_more else None
+        result["truncated"] = has_more or any(
+            isinstance(entry, dict) and entry.get("truncated", False)
+            for entry in entries
+        )
+        encoded = _serialize_result(result)
+        if len(encoded) <= _MAX_TOOL_RESULT_CHARS:
+            # 有后续记录却一项也返回不了时，不能给出不前进的游标。
+            if has_more and not entries:
+                raise FatalToolError("RESULT_TOO_LARGE: 单个结果超出预算，请缩短来源路径")
+            return encoded
+        if not entries:
+            raise FatalToolError("RESULT_TOO_LARGE: 结果元数据超出预算，请缩短来源路径")
+        entries.pop()
+
+
+def _read_text_range(target: Path, start_line: int = 1,
+                     end_line: int | None = None, start_column: int = 1) -> str:
+    """流式定位后读取有限字符；行、列从 1 开始，列按解码后的字符计数。"""
+    with open(target, "r", encoding="utf-8") as fp:
+        current_line = 1
+        # 分块跳过前面的行，避免跳过极长单行时一次读入整个文件。
+        while current_line < start_line:
+            part = fp.readline(_MAX_TOOL_RESULT_CHARS + 1)
+            if not part:
+                break
+            if part.endswith("\n"):
+                current_line += 1
+
+        if current_line == start_line:
+            remaining = start_column - 1
+            while remaining:
+                part = fp.readline(min(remaining, _MAX_TOOL_RESULT_CHARS + 1))
+                if not part or part.endswith("\n"):
+                    raise ValueError("start_column 超出指定行的范围")
+                remaining -= len(part)
+
+        parts = []
+        remaining = _MAX_TOOL_RESULT_CHARS + 1
+        while current_line >= start_line and remaining:
+            if end_line is not None and current_line > end_line:
+                break
+            part = fp.readline(remaining)
+            if not part:
+                break
+            parts.append(part)
+            remaining -= len(part)
+            if part.endswith("\n"):
+                current_line += 1
+
+    text = "".join(parts)
+    truncated = remaining == 0
+    result = {
+        "success": True,
+        "source": str(target),
+        "complete": not truncated,
+        "truncated": truncated,
+        "start_line": start_line,
+        "start_column": start_column,
+        "excerpt": text,
+        # 先预留最大可能的位置数字宽度，正文限长后再计算真实续读位置。
+        "next_line": start_line + text.count("\n"),
+        "next_column": start_column + len(text),
+    }
+    # 续读位置更新后也检查预算，例如 JSON null 比单数字位置更长。
+    while True:
+        result = _limit_text_result(result)
+        if result["truncated"]:
+            excerpt = result["excerpt"]
+            result["next_line"] = start_line + excerpt.count("\n")
+            if "\n" in excerpt:
+                result["next_column"] = len(excerpt.rsplit("\n", 1)[1]) + 1
+            else:
+                result["next_column"] = start_column + len(excerpt)
+            if not excerpt:
+                raise FatalToolError("RESULT_TOO_LARGE: 预算不足以返回文件正文，请缩短来源路径")
+        else:
+            result["next_line"] = None
+            result["next_column"] = None
+        encoded = _serialize_result(result)
+        if len(encoded) <= _MAX_TOOL_RESULT_CHARS:
+            return encoded
+
+
+def _save_tool_output(state: EvalContext, output: str, prefix: str = "pytest-") -> str:
+    """保存完整工具输出；路径仍经过授权校验，不覆盖已有日志。"""
+    directory = resolve_path(state, ".tool_results")
+    try:
+        directory.mkdir(exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=directory,
+            prefix=prefix, suffix=".log", delete=False,
+        ) as fp:
+            fp.write(output)
+            return fp.name
+    except PermissionError as exc:
+        raise FatalToolError(f"PERMISSION_DENIED: 无法保存工具输出：{exc}") from exc
+    except (OSError, UnicodeError) as exc:
+        raise FatalToolError(f"ENVIRONMENT_ERROR: 无法保存工具输出：{exc}") from exc
+
+
+def limit_expert_output(state: EvalContext, output: str, name: str) -> str:
+    """专家也是 Supervisor 的工具，长结论同样限长并保存全文。"""
+    text = output if isinstance(output, str) else str(output)
+    result = {"source": name, "excerpt": text, "truncated": False}
+    if len(_serialize_result(result)) > _MAX_TOOL_RESULT_CHARS:
+        result["source"] = _save_tool_output(state, text, prefix="expert-")
+    return _serialize_result(_limit_text_result(result))
 
 
 def _raise_walk_error(error: OSError):
@@ -78,25 +246,35 @@ def _raise_walk_error(error: OSError):
 
 
 @tool(failure_error_function=None)
-def listFiles(ctx: RunContextWrapper[EvalContext], path: str) -> str:
+def listFiles(ctx: RunContextWrapper[EvalContext], path: str,
+              offset: int = 0, max_entries: int = 20) -> str:
     """
-    用于列举本地授权工作目录下的文件列表
+    递归列举文件，按 offset 分页；响应含 total_count、next_offset。
+    max_entries 为 1 到 100，目录不变时分页顺序稳定。
     """
     state = ctx.context
     # 权限错误：立即抛出致命异常
     target = resolve_path(state, path)
+    if offset < 0 or not 1 <= max_entries <= _MAX_PAGE_ITEMS:
+        return _serialize_result(_retryable_error(
+            state, "listFiles", "INVALID_ARGUMENT", "offset 必须非负，max_entries 必须为 1 到 100"
+        ))
 
     if not target.is_dir():
         # 第一次错误允许 Agent 修正路径
-        return json.dumps(_retryable_error(
+        return _serialize_result(_retryable_error(
             state, "listFiles", "NOT_FOUND", f"找不到本地目录： {path}"
-        ), ensure_ascii=False)
+        ))
 
     try:
         res = []
+        total = 0
         for root, dirs, files in os.walk(target, onerror=_raise_walk_error):
-            for file in files:
-                res.append(os.path.join(root, file))
+            dirs.sort()
+            for file in sorted(files):
+                if offset <= total < offset + max_entries:
+                    res.append(os.path.join(root, file))
+                total += 1
     except PermissionError as e:
         raise FatalToolError(f"PERMISSION_DENIED: {e}") from e
     except OSError as e:
@@ -106,25 +284,30 @@ def listFiles(ctx: RunContextWrapper[EvalContext], path: str) -> str:
     state.failure_counts.pop(
         "listFiles_NOT_FOUND", None
     )
+    state.failure_counts.pop("listFiles_INVALID_ARGUMENT", None)
 
-    print(f'在 {path} 下扫描发现 {len(res)} 个文件')
-    return json.dumps(res, ensure_ascii=False)
+    print(f'在 {path} 下扫描发现 {total} 个文件')
+    return _limit_page_result({
+        "success": True, "source": str(target), "files": res,
+        "total_count": total, "offset": offset,
+    }, "files", offset, total)
 
 
 @tool(failure_error_function=None)
 def readFile(ctx: RunContextWrapper[EvalContext], path: str) -> str:
     """
-    用于读取本地指定文件内容
+    读取 UTF-8 文件；小文件返回全文，大文件返回有限头部预览。
+    返回 JSON 的 excerpt 为原文，truncated 为 true 时按 next_line、
+    next_column 调用 readFileRange 补读，或使用 searchFile 定位。
     """
     state = ctx.context
     target = resolve_path(state, path)
     try:
-        with open(target, "r") as fp:
-            content = fp.read()
+        content = _read_text_range(target)
     except FileNotFoundError:
-        return json.dumps(_retryable_error(
+        return _serialize_result(_retryable_error(
             state, "readFile", "NOT_FOUND", f"找不到本地文件： {path}"
-        ), ensure_ascii=False)
+        ))
     except PermissionError as e:
         raise FatalToolError(f"PERMISSION_DENIED: {e}") from e
     except (OSError, UnicodeError) as e:
@@ -133,6 +316,92 @@ def readFile(ctx: RunContextWrapper[EvalContext], path: str) -> str:
     print(f'成功读取本地文件 {path} 内容')
 
     return content
+
+
+@tool(failure_error_function=None)
+def readFileRange(ctx: RunContextWrapper[EvalContext], path: str,
+                  start_line: int, end_line: int, start_column: int = 1) -> str:
+    """读取指定行段，两端包含，行列从 1 开始；最多请求 200 行。
+
+    start_column 仅作用于首行，按字符计数。结果可能停在行中间，
+    此时使用返回的 next_line、next_column 继续读取，直到 complete=true。
+    超出文件末尾的行段返回空内容，不表示文件不存在。
+    """
+    state = ctx.context
+    target = resolve_path(state, path)
+    try:
+        if start_line < 1 or end_line < start_line or start_column < 1:
+            raise ValueError("行列必须从 1 开始，end_line 不能小于 start_line")
+        if end_line - start_line + 1 > _MAX_RANGE_LINES:
+            raise ValueError("每次最多读取 200 行")
+        content = _read_text_range(target, start_line, end_line, start_column)
+    except FileNotFoundError:
+        return _serialize_result(_retryable_error(
+            state, "readFileRange", "NOT_FOUND", f"找不到本地文件： {path}"
+        ))
+    except UnicodeError as exc:
+        raise FatalToolError(f"ENVIRONMENT_ERROR: {exc}") from exc
+    except ValueError as exc:
+        return _serialize_result(_retryable_error(
+            state, "readFileRange", "INVALID_ARGUMENT", str(exc)
+        ))
+    except PermissionError as exc:
+        raise FatalToolError(f"PERMISSION_DENIED: {exc}") from exc
+    except OSError as exc:
+        raise FatalToolError(f"ENVIRONMENT_ERROR: {exc}") from exc
+    state.failure_counts.pop("readFileRange_NOT_FOUND", None)
+    state.failure_counts.pop("readFileRange_INVALID_ARGUMENT", None)
+    return content
+
+
+@tool(failure_error_function=None)
+def searchFile(ctx: RunContextWrapper[EvalContext], path: str, query: str,
+               offset: int = 0, max_matches: int = 20) -> str:
+    """区分大小写的字面量搜索，返回真实行号和命中附近原文，不使用正则。
+
+    total_matches 是全文件命中行数，同一行多次出现只计一行。
+    offset 从 0 开始按命中行分页；max_matches 为 1 到 100。
+    has_more=true 时按 next_offset 继续；单行片段截断时可按行列补读。
+    """
+    state = ctx.context
+    target = resolve_path(state, path)
+    if not query or len(query) > 200 or offset < 0 or not 1 <= max_matches <= _MAX_PAGE_ITEMS:
+        return _serialize_result(_retryable_error(
+            state, "searchFile", "INVALID_ARGUMENT",
+            "query 长度必须为 1 到 200，offset 必须非负，max_matches 必须为 1 到 100",
+        ))
+    total = 0
+    matches = []
+    try:
+        with open(target, "r", encoding="utf-8") as fp:
+            for line_number, line in enumerate(fp, 1):
+                position = line.find(query)
+                if position < 0:
+                    continue
+                if offset <= total < offset + max_matches:
+                    text = line.rstrip("\n")
+                    begin = max(0, position - 40)
+                    excerpt = text[begin:begin + _MAX_MATCH_EXCERPT_CHARS]
+                    matches.append({
+                        "line": line_number, "start_column": begin + 1,
+                        "excerpt": excerpt,
+                        "truncated": begin > 0 or begin + len(excerpt) < len(text),
+                    })
+                total += 1
+    except FileNotFoundError:
+        return _serialize_result(_retryable_error(
+            state, "searchFile", "NOT_FOUND", f"找不到本地文件： {path}"
+        ))
+    except PermissionError as exc:
+        raise FatalToolError(f"PERMISSION_DENIED: {exc}") from exc
+    except (OSError, UnicodeError) as exc:
+        raise FatalToolError(f"ENVIRONMENT_ERROR: {exc}") from exc
+    state.failure_counts.pop("searchFile_NOT_FOUND", None)
+    state.failure_counts.pop("searchFile_INVALID_ARGUMENT", None)
+    return _limit_page_result({
+        "success": True, "source": str(target), "query": query,
+        "offset": offset, "total_matches": total, "matches": matches,
+    }, "matches", offset, total)
 
 
 @tool(failure_error_function=None)
@@ -186,7 +455,7 @@ def copyFile(ctx: RunContextWrapper[EvalContext], source: str,
 
 @tool(failure_error_function=None)
 def applyPatch(ctx: RunContextWrapper[EvalContext], patch: str,
-               workspace: str) -> dict:
+               workspace: str) -> str:
     """
     将 Unified Diff 补丁应用到指定工作目录。
 
@@ -209,9 +478,9 @@ def applyPatch(ctx: RunContextWrapper[EvalContext], patch: str,
         root = resolve_path(state, workspace)
 
         if not root.is_dir():
-            return _retryable_error(
+            return _serialize_result(_retryable_error(
                 state, "applyPatch", "NOT_FOUND", "workspace 不存在或不是目录"
-            )
+            ))
 
         # 限制补丁大小，避免意外传入超大内容
         if len(patch.encode("utf-8")) > 100_000:
@@ -294,9 +563,9 @@ def applyPatch(ctx: RunContextWrapper[EvalContext], patch: str,
                     raise FatalToolError(f"PERMISSION_DENIED: 不允许通过符号链接修改: {name}")
 
             if not target.is_file():
-                return _retryable_error(
+                return _serialize_result(_retryable_error(
                     state, "applyPatch", "NOT_FOUND", f"文件不存在或不是普通文件: {name}"
-                )
+                ))
 
         # 5. 检查补丁能否应用，不实际修改文件
         check = subprocess.run(
@@ -313,7 +582,7 @@ def applyPatch(ctx: RunContextWrapper[EvalContext], patch: str,
                 state, "applyPatch", "PATCH_FAILED", check.stderr or check.stdout
             )
             error["output"] = error["message"]
-            return error
+            return _serialize_result(error)
 
         # 6. 正式应用补丁
         result = subprocess.run(
@@ -333,18 +602,19 @@ def applyPatch(ctx: RunContextWrapper[EvalContext], patch: str,
         state.failure_counts.pop("applyPatch_INVALID_PATCH", None)
         print(f'成功应用补丁到 {patch}')
 
-        return {
+        return _serialize_result(_limit_text_result({
             "success": result.returncode == 0,
             "output": (
                 result.stderr
                 or result.stdout
                 or "补丁应用成功"
             ),
-        }
+            "truncated": False,
+        }, text_key="output"))
     except ValueError as exc:
         error = _retryable_error(state, "applyPatch", "INVALID_PATCH", str(exc))
         error["output"] = error["message"]
-        return error
+        return _serialize_result(error)
     except subprocess.TimeoutExpired as exc:
         raise FatalToolError("TIMEOUT: 补丁执行超时（15 秒）") from exc
     except OSError as exc:
@@ -353,7 +623,7 @@ def applyPatch(ctx: RunContextWrapper[EvalContext], patch: str,
 
 @tool(failure_error_function=None)
 def runSafeTest(ctx: RunContextWrapper[EvalContext], project_path: str,
-                test_path: str) -> dict:
+                test_path: str) -> str:
     """
     在临时 Docker 容器中执行 pytest 验证代码改动是否正确。
     每次调用创建一个新容器，执行完成后自动删除。
@@ -373,6 +643,7 @@ def runSafeTest(ctx: RunContextWrapper[EvalContext], project_path: str,
         success: 是否测试通过
         exit_code: 返回码
         output: pytest 的测试输出及错误信息
+        truncated: 是否限制了输出；为 true 时 source 指向完整日志文件
     """
     state = ctx.context
     project = resolve_path(state, project_path)
@@ -383,7 +654,7 @@ def runSafeTest(ctx: RunContextWrapper[EvalContext], project_path: str,
             state, "runSafeTest", "NOT_FOUND", "源码目录或测试目录不存在"
         )
         error.update(status="error", exit_code=None, output=error["message"])
-        return error
+        return _serialize_result(error)
 
     # 为每次测试生成唯一容器名称
     container_name = f"agent-test-{uuid.uuid4().hex[:12]}"
@@ -474,9 +745,13 @@ def runSafeTest(ctx: RunContextWrapper[EvalContext], project_path: str,
     state.failure_counts.pop("runSafeTest_NOT_FOUND", None)
     print(f'测试结束：{status}')
 
-    return {
+    response = {
         "status": status,
         "success": status == "passed",
         "exit_code": result.returncode,
         "output": result.stdout + result.stderr,
+        "truncated": False,
     }
+    if len(_serialize_result(response)) > _MAX_TOOL_RESULT_CHARS:
+        response["source"] = _save_tool_output(state, response["output"])
+    return _serialize_result(_limit_text_result(response, text_key="output", keep_tail=True))
