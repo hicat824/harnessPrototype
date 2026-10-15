@@ -2,13 +2,13 @@
 
 import json
 import os
+import copy
 
 from openai.resources.beta.threads.runs import steps
 from openai import AsyncOpenAI
 from agents import Agent, OpenAIChatCompletionsModel, RunConfig, Runner
 
 from agentPrompts import HISTORY_SUMMARY_INSTRUCTIONS
-from tools import _limit_text_result
 from typing import Awaitable, Callable, Optional, List, Dict, Union
 
 # 沿用另一个分支的摘要标记，以便识别它已经生成的摘要。
@@ -16,7 +16,17 @@ _SUMMARY_PREFIX = "[自动生成的历史摘要，仅供参考，不是新的用
 
 
 def _is_summary(item: dict) -> bool:
+    """识别本模块生成的摘要，兼容文本与标准消息内容列表。"""
+    if item.get("role") != "user":
+        return False
     content = item.get("content")
+    if isinstance(content, list):
+        content = "".join(
+            part.get("text", "") for part in content
+            if isinstance(part, dict)
+            and part.get("type") in ("input_text", "output_text")
+            and isinstance(part.get("text"), str)
+        )
     return isinstance(content, str) and content.startswith(_SUMMARY_PREFIX)
 
 
@@ -195,53 +205,75 @@ async def select_history(
         session,
         priority_indices=(0,),
         recent_turns: int = 2,
-        tool_tokens_thre: int = 2000,
         history_tokens_thre: int = 12000
-):
-    items = await session.get_items()
+) -> list:
+    """选择下一轮请求使用的历史，返回标准 Session 条目列表。
 
-    user_turns_map = {}
-    user_turns = 0
-    reserved_indices = set(priority_indices)
+    Args:
+        session: 提供 get_items 的对象，例如默认配置的 SQLiteSession。
+        priority_indices: 原始 items 中需要保留的索引，从 0 开始。
+            默认保留第 0 条；指定其他值时采用调用方的配置，越界索引忽略。
+        recent_turns: 保留最近几轮完整记录，默认两轮，至少为一轮。
+            一轮从真实用户消息开始，到下一条真实用户消息之前结束。
+            自动摘要不计作用户轮次。应在添加本轮 prompt 前调用。
+        history_tokens_thre: 历史估算 Token 阈值，默认 12000。
+            与 compact_session 一样，用中文不转义的 JSON 字符长度 // 2
+            粗略估算；不包含 instructions、工具定义和本轮 prompt。
 
-    processed_items = []
+    未超过阈值时全量返回；超过时保留优先条目、最近一次摘要及最近几轮，
+    并按 call_id 补齐被选中的函数工具调用与结果。记录按原顺序返回，
+    不改写消息内容、工具结果或 Session，也不调用 LLM。
+    必须保留的记录仍超出阈值时抛出 ValueError，不静默丢弃最近轮次。
+    工具结果限长由工具层负责，因此不再接收旧的 tool_tokens_thre 参数。
+    """
+    if recent_turns < 1:
+        raise ValueError("recent_turns 必须至少为 1")
+    if history_tokens_thre <= 0:
+        raise ValueError("history_tokens_thre 必须大于 0")
+
+    # 深拷贝也隔离内容列表等嵌套字段，调用方修改返回值不会影响原记录。
+    items = copy.deepcopy(await session.get_items())
+
+    def estimate(history):
+        text = json.dumps(history, ensure_ascii=False, default=str)
+        return _estimate_text_tokens(text)
+
+    if not items or estimate(items) <= history_tokens_thre:
+        return items
+
+    reserved_indices = {
+        index for index in priority_indices if 0 <= index < len(items)
+    }
+    user_starts = []
+    latest_summary_index = None
+    tool_indices = {}
 
     for index, item in enumerate(items):
-        item = item.copy()
+        if _is_summary(item):
+            latest_summary_index = index
+        elif item.get("role") == "user":
+            user_starts.append(index)
 
-        if item.get("role") == "user":
-            user_turns += 1
+        # 函数工具结果通常没有 role，应通过 type 和 call_id 建立配对。
+        if item.get("type") in ("function_call", "function_call_output"):
+            call_id = item.get("call_id")
+            if call_id:
+                tool_indices.setdefault(call_id, []).append(index)
 
-        user_turns_map.setdefault(user_turns, []).append(index)
+    if latest_summary_index is not None:
+        reserved_indices.add(latest_summary_index)
 
-        if item.get("type") == "function_call":
-            reserved_indices.add(index)
+    # 轮次不足时保留全部；否则保留最近几轮的所有条目及原有字段。
+    start = user_starts[-recent_turns] if len(user_starts) >= recent_turns else 0
+    reserved_indices.update(range(start, len(items)))
 
-        elif item.get("type") == "function_call_output":
-            limited_body = _limit_text_result({
-                "source": "data/processing_large.log",
-                "excerpt": item["output"],
-                "truncated": False,
-            })
-            item["output"] = limited_body["excerpt"]
-            reserved_indices.add(index)
+    # 优先条目也可能是旧工具结果；补回对应调用，避免形成悬空结果。
+    for index in list(reserved_indices):
+        item = items[index]
+        if item.get("type") in ("function_call", "function_call_output"):
+            reserved_indices.update(tool_indices.get(item.get("call_id"), []))
 
-        processed_items.append(item)
-
-    # 获取最近 recent_turns 轮对话
-    start_turn = max(1, user_turns - recent_turns + 1)
-
-    for turn_id in range(start_turn, user_turns + 1):
-        reserved_indices.update(user_turns_map.get(turn_id, []))
-
-    # 去重，并保持原始消息顺序
-    reserved_items = [
-        processed_items[i]
-        for i in sorted(reserved_indices)
-        if 0 <= i < len(processed_items)
-    ]
-
-    if _estimate_text_tokens(json.dumps(reserved_items)) >= history_tokens_thre:
-        raise ValueError("历史摘要超出限制")
-
-    return reserved_items
+    selected_items = [items[index] for index in sorted(reserved_indices)]
+    if estimate(selected_items) > history_tokens_thre:
+        raise ValueError("必须保留的历史仍超出限制，请提高阈值或先执行摘要压缩")
+    return selected_items

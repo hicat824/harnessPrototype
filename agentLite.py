@@ -3,6 +3,7 @@ import asyncio
 from agents import (
     Agent,
     Runner,
+    RunConfig,
     OpenAIChatCompletionsModel,
     OpenAIResponsesModel,
     set_tracing_disabled,
@@ -106,7 +107,7 @@ async def _limited_expert_output(run_result):
 
 
 class AgentLite:
-    def __init__(self):
+    def __init__(self, session=None):
         self._client = None
         self._mcp_server = None
         self._python_agent = None
@@ -121,8 +122,11 @@ class AgentLite:
         ]
         # self._client = self._initDSClient()
         self._thread_id = os.environ["THREAD_ID"]
-        self._session_id = "testSession"
-        self._session = SQLiteSession(self._session_id, "/media/xumaozhou/data/AI/local_agent_test/session.db")
+        # 测试可传入独立 Session，避免覆盖日常对话数据库。
+        self._session_id = session.session_id if session is not None else "testSession"
+        self._session = session if session is not None else SQLiteSession(
+            self._session_id, "/media/xumaozhou/data/AI/local_agent_test/session.db"
+        )
 
     async def initDSClientWithMCP(self):
         self._session_id = f'session_{uuid.uuid4().hex[:12]}'
@@ -201,30 +205,66 @@ class AgentLite:
         if self._mcp_server is not None:
             await self._mcp_server.__aexit__(None, None, None)
 
-    async def simpleCallLLM(self, prompt: str, eval_context: Optional[EvalContext] = None):
-        with trace(workflow_name="Conversation", group_id=self._thread_id):
+    async def simpleCallLLM(
+            self, prompt: str, eval_context: Optional[EvalContext] = None,
+            *, debug_info: Optional[dict] = None, max_turns: Optional[int] = None,
+    ):
+        """执行一次请求，仍返回 bool；调试时额外收集结论、usage 和错误。
+
+        debug_info 由调用方提供，便于测试保存结果；调试请求禁用远程 tracing。
+        max_turns 未指定时沿用 SDK 默认值。历史选择由调用方在请求前完成。
+        """
+        if debug_info is not None:
+            debug_info.update(final_output=None, usage=None, error=None)
+        with trace(
+            workflow_name="Conversation", group_id=self._thread_id,
+            disabled=debug_info is not None,
+        ):
             try:
                 # 默认每个任务使用独立计数；多轮任务可显式复用上下文。
                 context = eval_context if eval_context is not None else EvalContext()
-                response = await Runner.run(self._client, prompt, session=self._session,
-                                            context=context)
+                run_options = {"session": self._session, "context": context}
+                if max_turns is not None:
+                    run_options["max_turns"] = max_turns
+                if debug_info is not None:
+                    run_options["run_config"] = RunConfig(tracing_disabled=True)
+                response = await Runner.run(self._client, prompt, **run_options)
                 print(f"answer = {response.final_output}")
 
                 usage = response.context_wrapper.usage
+                if debug_info is not None:
+                    debug_info["final_output"] = response.final_output
+                    debug_info["usage"] = {
+                        "requests": usage.requests,
+                        "input_tokens": usage.input_tokens,
+                        "output_tokens": usage.output_tokens,
+                        "total_tokens": usage.total_tokens,
+                    }
                 print("请求次数:", usage.requests)
                 print("输入 Token:", usage.input_tokens)
                 print("输出 Token:", usage.output_tokens)
                 print("总 Token:", usage.total_tokens)
                 return True
             except ModelTimeoutError as e:
+                if debug_info is not None:
+                    debug_info["error"] = f"{type(e).__name__}: {e}"
                 print("Agents SDK 模型超时:", e)
 
             except openai.APITimeoutError as e:
+                if debug_info is not None:
+                    debug_info["error"] = f"{type(e).__name__}: {e}"
                 print("OpenAI SDK HTTP超时:", e)
                 print("底层异常:", repr(e.__cause__))
 
             except FatalToolError as e:
+                if debug_info is not None:
+                    debug_info["error"] = f"{type(e).__name__}: {e}"
                 print(f"工具调用失败：{e}")
+
+            except Exception as e:
+                if debug_info is not None:
+                    debug_info["error"] = f"{type(e).__name__}: {e}"
+                raise
 
         return False
 

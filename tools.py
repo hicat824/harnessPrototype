@@ -10,7 +10,7 @@ import tempfile
 from dataclasses import dataclass, field
 from agents import RunContextWrapper
 from agents.decorators import tool
-from agents.exceptions import AgentsException
+from agents.exceptions import AgentsException, ModelBehaviorError
 
 __all__ = [
     "readFile",
@@ -87,6 +87,41 @@ def _retryable_error(state: EvalContext, tool_name: str, error_code: str,
 def _serialize_result(result: dict) -> str:
     """统一返回 JSON 字符串，避免 SDK 再将字典转成 Python repr。"""
     return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+
+
+def _tool_input_error(ctx, error: Exception) -> str:
+    """将 SDK 的入参校验错误反馈给模型；致命错误和其他异常继续抛出。"""
+    prefix = f"Invalid JSON input for tool {ctx.tool_name}"
+    if not isinstance(error, ModelBehaviorError) or not (
+            str(error) == prefix or str(error).startswith(prefix + ":")):
+        raise error
+    if not isinstance(ctx.context, EvalContext):
+        raise FatalToolError("ENVIRONMENT_ERROR: 工具调用需要 EvalContext") from error
+
+    try:
+        arguments = json.loads(ctx.tool_arguments)
+    except json.JSONDecodeError:
+        message = "参数不是合法 JSON，请按工具 schema 重新提供 JSON 对象"
+    else:
+        if not isinstance(arguments, dict):
+            message = "参数必须是 JSON 对象，请按工具 schema 提供字段"
+        else:
+            # 本模块的工具名称与全局变量同名，直接复用 SDK 对外提供的 schema。
+            schema = globals()[ctx.tool_name].params_json_schema
+            missing = [name for name in schema.get("required", []) if name not in arguments]
+            if missing:
+                message = "缺少必填参数：" + ", ".join(missing) + "；请补齐后重试"
+            else:
+                fields = ", ".join(
+                    f"{name}:{field.get('type', '见 schema')}"
+                    for name, field in schema["properties"].items()
+                )
+                message = "参数类型或结构不符合工具 schema，请修正后重试：" + fields
+
+    # 与函数体内的参数错误共用计数；同一任务、同一工具累计两次即终止。
+    return _serialize_result(_retryable_error(
+        ctx.context, ctx.tool_name, "INVALID_ARGUMENT", message,
+    ))
 
 
 def _limit_text_result(result: dict, text_key: str = "excerpt",
@@ -245,7 +280,7 @@ def _raise_walk_error(error: OSError):
     raise error
 
 
-@tool(failure_error_function=None)
+@tool(failure_error_function=_tool_input_error)
 def listFiles(ctx: RunContextWrapper[EvalContext], path: str,
               offset: int = 0, max_entries: int = 20) -> str:
     """
@@ -293,7 +328,7 @@ def listFiles(ctx: RunContextWrapper[EvalContext], path: str,
     }, "files", offset, total)
 
 
-@tool(failure_error_function=None)
+@tool(failure_error_function=_tool_input_error)
 def readFile(ctx: RunContextWrapper[EvalContext], path: str) -> str:
     """
     读取 UTF-8 文件；小文件返回全文，大文件返回有限头部预览。
@@ -313,12 +348,13 @@ def readFile(ctx: RunContextWrapper[EvalContext], path: str) -> str:
     except (OSError, UnicodeError) as e:
         raise FatalToolError(f"ENVIRONMENT_ERROR: {e}") from e
     state.failure_counts.pop("readFile_NOT_FOUND", None)
+    state.failure_counts.pop("readFile_INVALID_ARGUMENT", None)
     print(f'成功读取本地文件 {path} 内容')
 
     return content
 
 
-@tool(failure_error_function=None)
+@tool(failure_error_function=_tool_input_error)
 def readFileRange(ctx: RunContextWrapper[EvalContext], path: str,
                   start_line: int, end_line: int, start_column: int = 1) -> str:
     """读取指定行段，两端包含，行列从 1 开始；最多请求 200 行。
@@ -354,12 +390,13 @@ def readFileRange(ctx: RunContextWrapper[EvalContext], path: str,
     return content
 
 
-@tool(failure_error_function=None)
+@tool(failure_error_function=_tool_input_error)
 def searchFile(ctx: RunContextWrapper[EvalContext], path: str, query: str,
                offset: int = 0, max_matches: int = 20) -> str:
     """区分大小写的字面量搜索，返回真实行号和命中附近原文，不使用正则。
 
     total_matches 是全文件命中行数，同一行多次出现只计一行。
+    query 必须显式提供非空字符串，长度为 1 到 200，不能省略或用 null 代替。
     offset 从 0 开始按命中行分页；max_matches 为 1 到 100。
     has_more=true 时按 next_offset 继续；单行片段截断时可按行列补读。
     """
@@ -404,7 +441,7 @@ def searchFile(ctx: RunContextWrapper[EvalContext], path: str, query: str,
     }, "matches", offset, total)
 
 
-@tool(failure_error_function=None)
+@tool(failure_error_function=_tool_input_error)
 def writeFile(ctx: RunContextWrapper[EvalContext], path: str,
               content: str) -> dict | None:
     """
@@ -424,10 +461,11 @@ def writeFile(ctx: RunContextWrapper[EvalContext], path: str,
     except (OSError, UnicodeError) as e:
         raise FatalToolError(f"ENVIRONMENT_ERROR: {e}") from e
     state.failure_counts.pop("writeFile_NOT_FOUND", None)
+    state.failure_counts.pop("writeFile_INVALID_ARGUMENT", None)
     print(f'成功输出内容到 {path}')
 
 
-@tool(failure_error_function=None)
+@tool(failure_error_function=_tool_input_error)
 def copyFile(ctx: RunContextWrapper[EvalContext], source: str,
              target: str) -> bool | dict:
     """
@@ -449,27 +487,39 @@ def copyFile(ctx: RunContextWrapper[EvalContext], source: str,
     except OSError as e:
         raise FatalToolError(f"ENVIRONMENT_ERROR: {e}") from e
     state.failure_counts.pop("copyFile_NOT_FOUND", None)
+    state.failure_counts.pop("copyFile_INVALID_ARGUMENT", None)
     print(f'成功复制文件到{target}')
     return True
 
 
-@tool(failure_error_function=None)
+@tool(failure_error_function=_tool_input_error, docstring_style="google")
 def applyPatch(ctx: RunContextWrapper[EvalContext], patch: str,
                workspace: str) -> str:
     """
-    将 Unified Diff 补丁应用到指定工作目录。
+    将 Git 格式的 Unified Diff 补丁应用到指定项目目录。
 
-    参数:
-        patch: Agent 生成的补丁文本
-        workspace: 允许修改的工作目录
+    每个文件必须包含以下三行文件头，其中相对路径保持一致，a/、b/ 是补丁标记：
+        diff --git a/path/to/file b/path/to/file
+        --- a/path/to/file
+        +++ b/path/to/file
+    后面跟 @@ -旧起始行,旧行数 +新起始行,新行数 @@ 和变更正文。
+    旧行数 = 上下文行数 + 删除行数；新行数 = 上下文行数 + 新增行数。
+    上下文行以空格开头，删除行以 - 开头，新增行以 + 开头。
+    每个变更区块通常保留变更前后各 3 行原文作为上下文，文件边界除外。
+    不要只提供删除行和新增行；区块末尾也应保留后续上下文，除非已到文件末尾。
+    补丁末尾必须有换行符；按最新文件内容生成小范围补丁，避免算错行数。
 
-    返回:
-        success: 是否修改成功
-        output: 执行结果或错误信息
+    仅支持修改已有的普通文件，不支持新增、删除、重命名文件及修改文件权限。
+    同一类错误累计达到工具重试上限时会抛出 FatalToolError。
 
-    限制:
-        仅支持修改已有的普通文件。
-        不支持新增、删除、重命名文件及修改文件权限。
+    Args:
+        patch: 按上述 Git 格式提供的补丁文本，文件路径相对于 workspace 指定目录，
+            不要重复添加项目目录前缀。
+        workspace: 项目目录，可用相对于授权根目录的路径；a/、b/ 不是真实目录。
+
+    Returns:
+        JSON 字符串，success 表示是否修改成功，output 是结果或带修正建议的错误信息。
+        错误可重试时 retryable=true，应先根据 message 修正补丁。
     """
 
     state = ctx.context
@@ -507,7 +557,7 @@ def applyPatch(ctx: RunContextWrapper[EvalContext], patch: str,
         new_paths = []
 
         # 3. 提取补丁中涉及的文件路径
-        for line in patch.splitlines():
+        for line_number, line in enumerate(patch.splitlines(), 1):
 
             if line.startswith(forbidden):
                 raise FatalToolError("PERMISSION_DENIED: 补丁包含不允许的文件操作")
@@ -518,28 +568,38 @@ def applyPatch(ctx: RunContextWrapper[EvalContext], patch: str,
                     line,
                 )
 
-                if not match or match.group(1) != match.group(2):
-                    raise ValueError("不支持的补丁文件路径")
+                if not match:
+                    raise ValueError(
+                        f"第 {line_number} 行 Git 文件头格式错误；应为 diff --git a/<相对路径> b/<相对路径>，路径不能含空白"
+                    )
+                if match.group(1) != match.group(2):
+                    raise ValueError(
+                        f"第 {line_number} 行新旧文件路径不同；仅支持修改同一个已有文件，不支持重命名"
+                    )
 
                 diff_paths.append(match.group(1))
 
             elif line.startswith("--- "):
                 if not line.startswith("--- a/"):
-                    raise ValueError("无效的原文件路径")
+                    raise ValueError(
+                        f"第 {line_number} 行原文件头格式错误；应为 --- a/<相对路径>，路径相对于 workspace 指定目录"
+                    )
                 old_paths.append(line[6:])
 
             elif line.startswith("+++ "):
                 if not line.startswith("+++ b/"):
-                    raise ValueError("无效的新文件路径")
+                    raise ValueError(
+                        f"第 {line_number} 行新文件头格式错误；应为 +++ b/<相对路径>，路径相对于 workspace 指定目录"
+                    )
                 new_paths.append(line[6:])
 
         # 要求补丁中三种文件路径声明一致
-        if (
-            not diff_paths
-            or sorted(diff_paths) != sorted(old_paths)
-            or sorted(diff_paths) != sorted(new_paths)
-        ):
-            raise ValueError("补丁文件路径不一致")
+        if not diff_paths:
+            raise ValueError(
+                "缺少 diff --git 文件头；每个文件必须以 diff --git a/<相对路径> b/<相对路径> 开始，随后提供 --- a/ 和 +++ b/ 文件头"
+            )
+        if sorted(diff_paths) != sorted(old_paths) or sorted(diff_paths) != sorted(new_paths):
+            raise ValueError("文件头路径不一致；diff --git、--- a/、+++ b/ 必须声明相同的文件集合和相对路径")
 
         # 4. 检查文件是否属于允许修改的目录
         for name in diff_paths:
@@ -578,8 +638,22 @@ def applyPatch(ctx: RunContextWrapper[EvalContext], patch: str,
         )
 
         if check.returncode != 0:
+            git_message = check.stderr or check.stdout
+            # 不自动重算行数或修改补丁，让 Agent 根据具体错误重新生成。
+            if "corrupt patch" in git_message or "patch fragment without header" in git_message:
+                message = (
+                    "补丁语法错误：检查 @@ 区块行数（旧=上下文+删除，新=上下文+新增）及末尾换行。Git: "
+                    + git_message
+                )
+            elif "patch does not apply" in git_message or "patch failed" in git_message:
+                message = (
+                    "补丁上下文不匹配或缺少上下文行：请重新读取目标文件，按当前内容生成补丁；"
+                    "变更前后通常各保留 3 行原文（文件边界除外）。Git: " + git_message
+                )
+            else:
+                message = git_message
             error = _retryable_error(
-                state, "applyPatch", "PATCH_FAILED", check.stderr or check.stdout
+                state, "applyPatch", "PATCH_FAILED", message
             )
             error["output"] = error["message"]
             return _serialize_result(error)
@@ -600,6 +674,7 @@ def applyPatch(ctx: RunContextWrapper[EvalContext], patch: str,
         state.failure_counts.pop("applyPatch_NOT_FOUND", None)
         state.failure_counts.pop("applyPatch_PATCH_FAILED", None)
         state.failure_counts.pop("applyPatch_INVALID_PATCH", None)
+        state.failure_counts.pop("applyPatch_INVALID_ARGUMENT", None)
         print(f'成功应用补丁到 {patch}')
 
         return _serialize_result(_limit_text_result({
@@ -621,7 +696,7 @@ def applyPatch(ctx: RunContextWrapper[EvalContext], patch: str,
         raise FatalToolError(f"ENVIRONMENT_ERROR: {exc}") from exc
 
 
-@tool(failure_error_function=None)
+@tool(failure_error_function=_tool_input_error)
 def runSafeTest(ctx: RunContextWrapper[EvalContext], project_path: str,
                 test_path: str) -> str:
     """
@@ -743,6 +818,7 @@ def runSafeTest(ctx: RunContextWrapper[EvalContext], project_path: str,
 
     status = status_map[result.returncode]
     state.failure_counts.pop("runSafeTest_NOT_FOUND", None)
+    state.failure_counts.pop("runSafeTest_INVALID_ARGUMENT", None)
     print(f'测试结束：{status}')
 
     response = {
