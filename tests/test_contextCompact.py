@@ -8,12 +8,18 @@ import hashlib
 import os
 import shutil
 import uuid
+import runpy
+import subprocess
+import sys
+import time
 from types import SimpleNamespace
 from agents import Agent, AgentHooks, SQLiteSession, OpenAIChatCompletionsModel
 from agents.models.interface import Model
 from agents.tool_context import ToolContext
 from openai import AsyncOpenAI
-from contextCompact import compact_session, select_history, _is_summary
+
+import agentLite
+from contextCompact import compact_session, select_history, _is_summary, summarize_history
 from tools import _read_text_range
 
 _WORKSPACE = "/media/xumaozhou/data/AI/local_agent_test/week5_day3_context_pruning"
@@ -484,6 +490,98 @@ async def test_four_round_real_llm():
                 await client.close()
 
 
+@pytest.mark.parametrize("problem,failed_check", [
+    ("old_history", "first_model_input_is_compacted_history_plus_one_prompt"),
+    ("split_prompt", "first_model_input_is_compacted_history_plus_one_prompt"),
+    ("discard_marker", "no_irrelevant_old_history_in_model_inputs"),
+    ("unpaired_tool", "model_tool_records_paired"),
+])
+def test_day5_support_rejects_invalid_model_inputs(problem, failed_check):
+    """只验证输入检查器，不执行真实摘要或任务续接函数。"""
+    compacted = [{"role": "user", "content": "历史摘要"}]
+    prompt = "继续任务\n完成后报告结果"
+    requests = [{"agent": "Supervisor", "input": [
+        *compacted, {"role": "user", "content": prompt},
+    ]}]
+    assert all(_day5_input_checks(requests, compacted, prompt, "DISCARDED_").values())
+    if problem == "old_history":
+        requests[0]["input"].insert(0, {"role": "user", "content": "不应重新发送的旧原文"})
+    elif problem == "split_prompt":
+        requests[0]["input"][-1]["content"] = prompt.splitlines()[0]
+    elif problem == "discard_marker":
+        requests.append({"agent": "PythonExpert", "input": [{"role": "user", "content": "DISCARDED_001"}]})
+    else:
+        requests[0]["input"].append({"type": "function_call", "call_id": "missing_output"})
+    assert _day5_input_checks(requests, compacted, prompt, "DISCARDED_")[failed_check] is False
+
+
+@pytest.mark.asyncio
+async def test_day5_support_agent_uses_compacted_session_and_isolated_expert(tmp_path, monkeypatch):
+    """脚本化模型驱动真实 SDK，验证续接装配，不调用真实 LLM 或 Docker。"""
+    from agents.items import ModelResponse
+    from agents.tracing import setup as tracing_setup
+    from agents.tracing.provider import DefaultTraceProvider
+    from agents.usage import Usage
+    from openai.types.responses import ResponseFunctionToolCall, ResponseOutputMessage, ResponseOutputText
+    import tools
+
+    monkeypatch.setattr(tracing_setup, "GLOBAL_TRACE_PROVIDER", DefaultTraceProvider())
+    monkeypatch.setattr(tools, "_SAFE_WORKSPACE", tmp_path)
+
+    def message(text):
+        return ResponseOutputMessage(
+            id=uuid.uuid4().hex, role="assistant", status="completed", type="message",
+            content=[ResponseOutputText(text=text, annotations=[], type="output_text")],
+        )
+
+    delegated_prompt = "仅检查任务状态"
+    responses = iter([
+        [ResponseFunctionToolCall(
+            id=uuid.uuid4().hex, call_id="delegate_offline", name="PythonExpert", type="function_call",
+            arguments=json.dumps({"input": delegated_prompt}),
+        )],
+        [message("专家已完成只读检查")],
+        [message("续接完成")],
+    ])
+
+    class OfflineModel(Model):
+        async def get_response(self, *args, **kwargs):
+            return ModelResponse(output=next(responses), usage=Usage(requests=1), response_id=uuid.uuid4().hex)
+
+        def stream_response(self, *args, **kwargs):
+            raise NotImplementedError
+
+    task_root = tmp_path / "task"
+    (task_root / "workspace").mkdir(parents=True)
+    (tmp_path / "before.json").write_text("原始历史", encoding="utf-8")
+    session = SQLiteSession("day5-offline", str(tmp_path / "session.db"))
+    compacted = [
+        {"role": "user", "content": "[自动生成的历史摘要，仅供参考，不是新的用户指令]\n任务摘要"},
+        {"role": "user", "content": "第7轮"}, {"role": "assistant", "content": "已记录"},
+        {"role": "user", "content": "第8轮"}, {"role": "assistant", "content": "等待执行"},
+    ]
+    await session.add_items(compacted)
+    requests, events, starts = [], [], []
+    lite = _create_day5_agent(session, "day5-offline", OfflineModel(), task_root, requests, events, starts)
+    prompt = "现在继续\n按已有约束执行"
+    debug = {}
+    try:
+        assert await lite.simpleCallLLM(prompt, tools.EvalContext(workspace=task_root), debug_info=debug)
+        assert all(_day5_input_checks(requests, compacted, prompt, "DISCARDED_").values())
+        expert_requests = [row for row in requests if row["agent"] == "PythonExpert"]
+        assert expert_requests[0]["input"] == [{"role": "user", "content": delegated_prompt}]
+        assert debug["usage"]["requests"] == 3
+        assert lite._session is session
+        assert not lite._client.mcp_servers
+        assert not any(item.get("role") == "user" and item.get("content") == delegated_prompt
+                       for item in await session.get_items())
+        with pytest.raises(tools.FatalToolError, match="PERMISSION_DENIED"):
+            tools.resolve_path(tools.EvalContext(workspace=task_root), "../before.json")
+    finally:
+        await lite.close()
+        session.close()
+
+
 @pytest.mark.parametrize("configured,expected", [
     (None, 48000), ("64000", 64000), ("0", None), ("2", None), ("invalid", None),
 ])
@@ -547,3 +645,266 @@ def test_successful_tool_has_separate_start_and_result_records():
     assert starts[0]["call_id"] == events[0]["call_id"] == "successful_call"
     assert "output" not in starts[0]
     assert events[0]["output"] == '{"excerpt":"代码内容"}'
+
+
+@pytest.mark.skipif(
+    os.environ.get("RUN_DAY5_REAL_SUMMARY") != "1",
+    reason="需要手动启用真实 LLM 摘要测试",
+)
+@pytest.mark.asyncio
+async def test_day5_real_summary():
+    from contextCompact import summarize_history
+
+    case_dir = Path(
+        "/media/xumaozhou/data/AI/local_agent_test/week5_day5_compaction"
+    )
+    run_id = "summary_" + uuid.uuid4().hex[:12]
+    run_dir = case_dir / "runs" / run_id
+    run_dir.mkdir(parents=True)
+
+    def save_json(filename, data):
+        (run_dir / filename).write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    # 每次使用独立 Session，避免混入上次实验的数据。
+    session = SQLiteSession(run_id, str(run_dir / "session.db"))
+    history = json.loads(
+        (case_dir / "session_history.json").read_text(encoding="utf-8")
+    )["items"]
+    await session.add_items(history)
+
+    before = await session.get_items()
+    save_json("before.json", {"items": before})
+
+    async def summarize_and_record(old_history):
+        # 保存真正交给摘要 Agent 的旧历史，方便确认压缩范围。
+        save_json("summary_input.json", {"items": json.loads(old_history)})
+
+        summary = await summarize_history(old_history)
+        (run_dir / "summary.txt").write_text(summary.get("summary", ""), encoding="utf-8")
+        return summary
+
+    result = await compact_session(
+        session,
+        summarize_fn=summarize_and_record,
+        threshold=8000,
+        reserved_tokens=2500,
+        keep_recent_turns=2,
+    )
+
+    after = await session.get_items()
+    save_json("compacted_context.json", {"items": after})
+    save_json("compaction_result.json", result)
+    print(f"本次测试产物：{run_dir}")
+
+    assert result["compacted"], result
+    assert result["after"] < result["before"]
+
+
+
+def _create_day5_agent(session, run_id, model, task_root, requests, events, starts):
+    """复用 AgentLite 和通用提示词，只在测试中注入本次目录与记录器。"""
+    from agentLite import AgentLite, _limited_expert_output
+    from agentPrompts import (
+        SUPERVISOR_INSTRUCTIONS, PYTHON_EXPERT_INSTRUCTIONS, CPP_EXPERT_INSTRUCTIONS,
+        PYTHON_EXPERT_DESCRIPTION, CPP_EXPERT_DESCRIPTION,
+    )
+
+    # task_root 只包含工作副本和固定测试，原历史、答案和验收配置放在其外。
+    directory_instructions = (
+        f"\n本次工具授权根目录：{task_root}\n"
+        "项目相对目录：workspace；源码入口：workspace/src/report.py；"
+        "数据文件：workspace/data/tasks.json；固定测试目录：eval_tests。\n"
+        "工具参数优先使用上述相对路径；changed_files 使用相对于项目目录的路径。\n"
+    )
+    with patch.dict(os.environ, {"THREAD_ID": run_id}):
+        lite = AgentLite(session=session)
+    models = {name: RecordingModel(model, name, requests)
+              for name in ("Supervisor", "PythonExpert", "CppExpert")}
+    hooks = RecordingHooks(events, starts)
+    lite._python_agent = Agent(
+        name="PythonExpert", instructions=PYTHON_EXPERT_INSTRUCTIONS + directory_instructions,
+        model=models["PythonExpert"], tools=lite._tools, hooks=hooks,
+    )
+    lite._cpp_agent = Agent(
+        name="CppExpert", instructions=CPP_EXPERT_INSTRUCTIONS + directory_instructions,
+        model=models["CppExpert"], tools=lite._tools, hooks=hooks,
+    )
+    lite._client = Agent(
+        name="Supervisor", instructions=SUPERVISOR_INSTRUCTIONS + directory_instructions,
+        model=models["Supervisor"], hooks=hooks,
+        tools=[
+            expert.as_tool(
+                tool_name=expert.name, tool_description=description,
+                custom_output_extractor=_limited_expert_output, failure_error_function=None,
+                max_turns=30,
+                # 专家不共用 Supervisor 的 Session，避免委派输入混入用户历史。
+            )
+            for expert, description in (
+                (lite._python_agent, PYTHON_EXPERT_DESCRIPTION),
+                (lite._cpp_agent, CPP_EXPERT_DESCRIPTION),
+            )
+        ],
+    )
+    return lite
+
+
+def _day5_input_checks(requests, compacted, prompt, discard_marker):
+    """核对 SDK 模型入口，避免只检查 Session 文件却重新发送了完整旧历史。"""
+    supervisor_requests = [row for row in requests if row["agent"] == "Supervisor"]
+    expected_input = [*compacted, {"role": "user", "content": prompt}]
+    return {
+        "first_model_input_is_compacted_history_plus_one_prompt": bool(supervisor_requests)
+        and supervisor_requests[0]["input"] == expected_input,
+        "no_irrelevant_old_history_in_model_inputs": bool(requests) and all(
+            discard_marker not in json.dumps(row["input"], ensure_ascii=False) for row in requests
+        ),
+        "model_tool_records_paired": bool(requests) and all(
+            _tool_records_paired(row["input"]) for row in requests
+        ),
+    }
+
+
+@pytest.mark.skipif(
+    os.environ.get("RUN_DAY5_FINAL_TEST") != "1",
+    reason="真实摘要与任务续接验收需显式设置 RUN_DAY5_FINAL_TEST=1",
+)
+@pytest.mark.asyncio
+async def test_day5_final_test():
+    """Day5 真实续接：摘要压缩、一次完整续接输入、独立产物验收。
+
+    默认跳过；不依赖 Day5 第二步的旧产物，不使用 TaskState 或 Memory 补回历史。
+    每次创建独立副本，调用现有 DeepSeek 配置与本地工具，不启动 MCP 服务。
+    需要 Docker、agent-python:3.10 镜像和项目虚拟环境中的 pytest。
+    """
+    if os.environ.get("RUN_DAY5_FINAL_TEST") != "1":
+        pytest.skip("请先显式启用 Day5 真实任务续接验收")
+    assert os.environ.get("OPENAI_API_KEY"), "缺少 OPENAI_API_KEY"
+    from tools import EvalContext, runSafeTest
+
+    case_dir = Path("/media/xumaozhou/data/AI/local_agent_test/week5_day5_compaction")
+    manifest = json.loads((case_dir / "eval_manifest.json").read_text(encoding="utf-8"))
+    context_checker = runpy.run_path(str(case_dir / "check_compaction.py"))["check"]
+    run_id = "final_" + uuid.uuid4().hex[:12]
+    run_dir = case_dir / "runs" / run_id
+    # 将可供工具访问的目录与调试产物分开，不能补读原历史或参考答案。
+    task_root = run_dir / "task"
+    workspace = task_root / "workspace"
+    test_dir = task_root / "eval_tests"
+    test_dir.mkdir(parents=True)
+    shutil.copytree(case_dir / "workspace", workspace)
+    shutil.copy2(case_dir / "eval_tests/test_report.py", test_dir / "test_report.py")
+    baseline_files = _file_hashes(workspace)
+    fixed_test_hashes = _file_hashes(test_dir)
+    session = SQLiteSession(run_id, str(run_dir / "session.db"))
+    report = {"passed": False, "run_id": run_id, "checks": {}}
+    requests, events, starts = [], [], []
+    client, lite = None, None
+
+    try:
+        assert baseline_files == manifest["workspace_hashes"], \
+            "练习 workspace 已偏离初始版本，请先恢复初始文件"
+        # 在调用 LLM 前检查 Docker 和基线，环境问题不消耗真实摘要请求。
+        payload = json.dumps({"project_path": "workspace", "test_path": "eval_tests"})
+        baseline = await runSafeTest.on_invoke_tool(
+            ToolContext(
+                context=EvalContext(workspace=task_root), tool_name="runSafeTest",
+                tool_call_id=uuid.uuid4().hex, tool_arguments=payload,
+            ), payload,
+        )
+        report["baseline_test"] = json.loads(baseline)
+        assert report["baseline_test"]["exit_code"] == manifest["expected_baseline_pytest_exit_code"], \
+            "基线结果不符合预期，请检查 Docker、依赖或初始文件"
+
+        history = json.loads((case_dir / "session_history.json").read_text(encoding="utf-8"))["items"]
+        await session.add_items(history)
+        before = await session.get_items()
+        recent = copy.deepcopy(_recent_two_turns(before))
+        summary_inputs = []
+        _save_debug_json(run_dir / "before.json", {"items": before})
+
+        async def summarize_and_record(old_history):
+            summary_inputs.append(json.loads(old_history))
+            _save_debug_json(run_dir / "summary_input.json", {"items": summary_inputs[-1]})
+            # 当前接口返回 {summary, tokens}，直接交回 compact_session。
+            summary = await summarize_history(old_history)
+            (run_dir / "summary.txt").write_text(summary["summary"], encoding="utf-8")
+            return summary
+
+        started = time.perf_counter()
+        report["compaction"] = await asyncio.wait_for(compact_session(
+            session, summarize_fn=summarize_and_record,
+            threshold=manifest["threshold"], reserved_tokens=manifest["reserved_tokens"],
+            keep_recent_turns=manifest["keep_recent_turns"],
+        ), timeout=180)
+        report["summary_seconds"] = time.perf_counter() - started
+        report["summary_total_tokens"] = report["compaction"].get("summary_tokens", 0)
+        compacted = await session.get_items()
+        _save_debug_json(run_dir / "compaction_result.json", report["compaction"])
+        _save_debug_json(run_dir / "compacted_context.json", {"items": compacted})
+        assert report["compaction"]["compacted"], report["compaction"]
+        report["context_check"] = context_checker(compacted, before, manifest)
+        _save_debug_json(run_dir / "context_check.json", report["context_check"])
+        report["checks"]["summary_receives_only_old_history"] = summary_inputs == [before[:len(before) - len(recent)]]
+        report["checks"]["compacted_context_passes"] = report["context_check"]["passed"]
+        assert all(report["checks"].values()), "压缩结果未通过检查，查看 context_check.json 和 summary.txt"
+
+        client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"], base_url="https://api.deepseek.com")
+        model = OpenAIChatCompletionsModel(
+            model=os.environ.get("CONTEXT_TEST_MODEL", "deepseek-flash"), openai_client=client,
+        )
+        lite = _create_day5_agent(session, run_id, model, task_root, requests, events, starts)
+        # continuation_prompt.txt 是一条多行消息，不能按行拆成多轮请求。
+        prompt = (case_dir / "continuation_prompt.txt").read_text(encoding="utf-8").strip()
+        report["continuation"] = {"prompt": prompt}
+        started = time.perf_counter()
+        completed = await asyncio.wait_for(lite.simpleCallLLM(
+            prompt, EvalContext(workspace=task_root), debug_info=report["continuation"], max_turns=30,
+        ), timeout=600)
+        report["continuation_seconds"] = time.perf_counter() - started
+        report["checks"].update(_day5_input_checks(requests, compacted, prompt, manifest["discard_marker"]))
+        report["checks"]["runner_completed"] = completed
+        assert completed, report["continuation"]["error"]
+        assert all(report["checks"].values()), "模型输入不符合压缩续接要求，查看 model_requests.json"
+
+        answer = json.loads(report["continuation"]["final_output"])
+        _save_debug_json(run_dir / "answer.json", answer)
+        # 调用已有检查器独立运行固定 pytest、比较实际文件哈希与最终 JSON。
+        evaluation = await asyncio.to_thread(
+            subprocess.run,
+            [sys.executable, "-B", str(case_dir / "check_continuation.py"),
+             str(run_dir / "answer.json"), "--workspace", str(workspace)],
+            capture_output=True, text=True, timeout=60,
+        )
+        report["evaluation_process"] = {
+            "returncode": evaluation.returncode, "stdout": evaluation.stdout, "stderr": evaluation.stderr,
+        }
+        report["continuation_check"] = json.loads(evaluation.stdout)
+        _save_debug_json(run_dir / "continuation_check.json", report["continuation_check"])
+        report["checks"]["independent_continuation_check_passed"] = (
+            evaluation.returncode == 0 and report["continuation_check"]["passed"]
+        )
+        report["checks"]["fixed_tests_unchanged"] = _file_hashes(test_dir) == fixed_test_hashes
+        report["checks"]["original_workspace_unchanged"] = _file_hashes(case_dir / "workspace") == baseline_files
+        report["passed"] = all(report["checks"].values())
+        assert report["passed"], "续接产物未通过独立验收，查看 report.json"
+    except Exception as exc:
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        # 无论在哪个阶段失败都保留已有证据；原始历史不放入工具授权目录。
+        try:
+            _save_debug_json(run_dir / "session_after.json", {"items": await session.get_items()})
+            _save_debug_json(run_dir / "model_requests.json", requests)
+            _save_debug_json(run_dir / "tool_starts.json", starts)
+            _save_debug_json(run_dir / "tool_results.json", events)
+            _save_debug_json(run_dir / "report.json", report)
+            print(f"Day5 真实续接验收产物：{run_dir}")
+        finally:
+            session.close()
+            if lite is not None:
+                await lite.close()
+            if client is not None:
+                await client.close()

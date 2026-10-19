@@ -35,7 +35,7 @@ def _estimate_text_tokens(text: str) -> int:
     return len(text) // 2
 
 
-async def summarize_history(history: Union[str, List[Dict]]) -> str:
+async def summarize_history(history: Union[str, List[Dict]]) -> dict:
     """调用独立的摘要 Agent，将传入的旧历史合并为摘要文本。
 
     history 可以是历史条目列表，或 compact_session 提供的 JSON 字符串。
@@ -81,12 +81,17 @@ async def summarize_history(history: Union[str, List[Dict]]) -> str:
     summary = result.final_output
     if not isinstance(summary, str) or not summary.strip():
         raise ValueError("摘要 Agent 未返回有效的摘要文本")
-    return summary.strip()
+    total_tokens = result.context_wrapper.usage.total_tokens
+
+    return {
+        "summary": summary.strip(),
+        "tokens": total_tokens
+    }
 
 
 async def compact_session(
         session,
-        summarize_fn: Callable[[str], Awaitable[str]],
+        summarize_fn: Callable[[str], Awaitable[dict]],
         count_tokens_fn: Optional[Callable[[str], int]] = None,
         threshold: int = 8000,
         keep_recent_turns: int = 2,
@@ -167,13 +172,13 @@ async def compact_session(
         result["error"] = str(exc)
         return result
 
-    if not isinstance(summary, str):
+    if not isinstance(summary, dict):
         return skipped("invalid_summary")
-    if not summary.strip():
+    if "summary" not in summary or "tokens" not in summary:
         return skipped("empty_summary")
 
     new_items = [
-        {"role": "user", "content": _SUMMARY_PREFIX + summary.strip()},
+        {"role": "user", "content": _SUMMARY_PREFIX + summary.get("summary", "")},
         *recent_items,
     ]
     after_tokens = estimate(new_items)
@@ -198,6 +203,7 @@ async def compact_session(
         "before": before_tokens,
         "after": after_tokens,
         "saved_tokens": before_tokens - after_tokens,
+        "summary_tokens": summary.get("tokens", 0)
     }
 
 
