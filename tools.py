@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from agents import RunContextWrapper
 from agents.decorators import tool
 from agents.exceptions import AgentsException, ModelBehaviorError
+from baseModel import FileReadOutput, ToolOutputBase
 
 __all__ = [
     "readFile",
@@ -89,6 +90,12 @@ def _serialize_result(result: dict) -> str:
     return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
 
 
+def _serialize_read_result(result: dict) -> str:
+    """读取成功时校验正文和游标，失败时只返回公共错误字段。"""
+    model = FileReadOutput if result.get("success") else ToolOutputBase
+    return _serialize_result(model.model_validate(result).model_dump())
+
+
 def _tool_input_error(ctx, error: Exception) -> str:
     """将 SDK 的入参校验错误反馈给模型；致命错误和其他异常继续抛出。"""
     prefix = f"Invalid JSON input for tool {ctx.tool_name}"
@@ -119,9 +126,12 @@ def _tool_input_error(ctx, error: Exception) -> str:
                 message = "参数类型或结构不符合工具 schema，请修正后重试：" + fields
 
     # 与函数体内的参数错误共用计数；同一任务、同一工具累计两次即终止。
-    return _serialize_result(_retryable_error(
+    result = _retryable_error(
         ctx.context, ctx.tool_name, "INVALID_ARGUMENT", message,
-    ))
+    )
+    if ctx.tool_name in ("readFile", "readFileRange"):
+        return _serialize_read_result(result)
+    return _serialize_result(result)
 
 
 def _limit_text_result(result: dict, text_key: str = "excerpt",
@@ -230,6 +240,8 @@ def _read_text_range(target: Path, start_line: int = 1,
         "next_line": start_line + text.count("\n"),
         "next_column": start_column + len(text),
     }
+    # 先补齐公共字段再限长，不能在预算计算后追加 message、error_code 等元数据。
+    result = FileReadOutput.model_validate(result).model_dump()
     # 续读位置更新后也检查预算，例如 JSON null 比单数字位置更长。
     while True:
         result = _limit_text_result(result)
@@ -245,7 +257,7 @@ def _read_text_range(target: Path, start_line: int = 1,
         else:
             result["next_line"] = None
             result["next_column"] = None
-        encoded = _serialize_result(result)
+        encoded = _serialize_read_result(result)
         if len(encoded) <= _MAX_TOOL_RESULT_CHARS:
             return encoded
 
@@ -334,13 +346,14 @@ def readFile(ctx: RunContextWrapper[EvalContext], path: str) -> str:
     读取 UTF-8 文件；小文件返回全文，大文件返回有限头部预览。
     返回 JSON 的 excerpt 为原文，truncated 为 true 时按 next_line、
     next_column 调用 readFileRange 补读，或使用 searchFile 定位。
+    success 表示读取是否成功；失败时通过 error_code、message、retryable 说明原因。
     """
     state = ctx.context
     target = resolve_path(state, path)
     try:
         content = _read_text_range(target)
     except FileNotFoundError:
-        return _serialize_result(_retryable_error(
+        return _serialize_read_result(_retryable_error(
             state, "readFile", "NOT_FOUND", f"找不到本地文件： {path}"
         ))
     except PermissionError as e:
@@ -361,7 +374,9 @@ def readFileRange(ctx: RunContextWrapper[EvalContext], path: str,
 
     start_column 仅作用于首行，按字符计数。结果可能停在行中间，
     此时使用返回的 next_line、next_column 继续读取，直到 complete=true。
+    complete 只针对本次请求的行段，不代表整份文件都已读取。
     超出文件末尾的行段返回空内容，不表示文件不存在。
+    读取成功时 success=true；失败时返回 error_code、message、retryable。
     """
     state = ctx.context
     target = resolve_path(state, path)
@@ -372,13 +387,13 @@ def readFileRange(ctx: RunContextWrapper[EvalContext], path: str,
             raise ValueError("每次最多读取 200 行")
         content = _read_text_range(target, start_line, end_line, start_column)
     except FileNotFoundError:
-        return _serialize_result(_retryable_error(
+        return _serialize_read_result(_retryable_error(
             state, "readFileRange", "NOT_FOUND", f"找不到本地文件： {path}"
         ))
     except UnicodeError as exc:
         raise FatalToolError(f"ENVIRONMENT_ERROR: {exc}") from exc
     except ValueError as exc:
-        return _serialize_result(_retryable_error(
+        return _serialize_read_result(_retryable_error(
             state, "readFileRange", "INVALID_ARGUMENT", str(exc)
         ))
     except PermissionError as exc:

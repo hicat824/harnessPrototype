@@ -490,6 +490,435 @@ async def test_four_round_real_llm():
                 await client.close()
 
 
+_DAY6_WORKSPACE = Path("/media/xumaozhou/data/AI/local_agent_test/week5_day6_structured_output")
+
+
+def _day6_append_event(path, record):
+    """即时保存 SDK 事件；原始记录不放入 Agent 可读取的 task 目录。"""
+    with Path(path).open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+
+
+class Day6StreamingModel(Model):
+    """转发实际模型流，按单次请求保存原始增量，不把最终 JSON 人为切片。"""
+
+    def __init__(self, model, name, raw_path):
+        self.model, self.name, self.raw_path = model, name, raw_path
+        self.responses = []
+
+    async def get_response(self, *args, **kwargs):
+        return await self.model.get_response(*args, **kwargs)
+
+    def get_retry_advice(self, request):
+        return self.model.get_retry_advice(request)
+
+    async def stream_response(self, *args, **kwargs):
+        record = {"deltas": [], "completed": False, "has_tool_calls": False, "has_usage": False}
+        self.responses.append(record)
+        request_id = len(self.responses)
+        tools = kwargs.get("tools", args[3] if len(args) > 3 else [])
+        _day6_append_event(self.raw_path, {
+            "kind": "model_request", "agent": self.name, "request": request_id,
+            "tools": [tool.name for tool in tools],
+        })
+        try:
+            async for event in self.model.stream_response(*args, **kwargs):
+                _day6_append_event(self.raw_path, {
+                    "kind": "model_stream_event", "agent": self.name, "request": request_id,
+                    "data": event.model_dump(mode="json"),
+                })
+                if event.type == "response.output_text.delta":
+                    record["deltas"].append({"type": "text_delta", "data": event.delta})
+                elif event.type == "response.completed":
+                    record["completed"] = event.response.status == "completed"
+                    record["has_usage"] = event.response.usage is not None
+                    record["has_tool_calls"] = any(
+                        item.type == "function_call" for item in event.response.output
+                    )
+                yield event
+        except Exception as exc:
+            _day6_append_event(self.raw_path, {
+                "kind": "model_error", "agent": self.name, "request": request_id,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+            raise
+
+
+async def _day6_stream_attempt(agent, prompt, context, session, model, timeout):
+    """执行一次真实 SDK 流；返回结果、最后请求的真实增量、工具通知、Schema 异常。
+
+    context 是工具上下文，session 仅主任务使用；model 必须为 Day6StreamingModel。
+    仅将已收到模型完成事件的最终回答 Schema 异常交给调用方判断是否纠错。
+    网络、工具、取消、超时等执行异常直接传播，不重跑工具流程。
+    """
+    from agents import Runner, RunConfig
+    from agents.exceptions import ModelBehaviorError
+
+    result = Runner.run_streamed(
+        agent, prompt, context=context, session=session, max_turns=30 if agent.tools else 1,
+        run_config=RunConfig(tracing_disabled=True),
+    )
+    tool_events, tool_names = [], {}
+
+    async def consume():
+        async for event in result.stream_events():
+            if event.type != "run_item_stream_event":
+                continue
+            if event.name == "tool_called":
+                raw = event.item.raw_item
+                tool_names[raw.call_id] = raw.name
+                tool_events.append({"type": "tool_start", "tool_name": raw.name, "call_id": raw.call_id})
+            elif event.name == "tool_output":
+                raw = event.item.raw_item
+                tool_events.append({
+                    "type": "tool_end", "tool_name": tool_names.get(raw["call_id"]),
+                    "call_id": raw["call_id"], "data": raw["output"],
+                })
+        if result.run_loop_exception:
+            raise result.run_loop_exception
+
+    schema_error = None
+    try:
+        await asyncio.wait_for(consume(), timeout=timeout)
+    except ModelBehaviorError as exc:
+        last = model.responses[-1] if model.responses else {}
+        if not last.get("completed") or last.get("has_tool_calls"):
+            raise
+        schema_error = exc
+    except BaseException:
+        result.cancel()
+        raise
+
+    if not model.responses:
+        raise ValueError("未收到模型响应")
+    last = model.responses[-1]
+    if not last["completed"] or not last["has_usage"]:
+        raise ValueError("模型流未正常完成或未提供实际 usage")
+    if not last["deltas"]:
+        raise ValueError("未收到真实文本增量，不能以最终对象伪造流式片段")
+    if schema_error is None and (not result.is_complete or result.interruptions):
+        raise ValueError("Agent 流未完整结束或存在待处理审批")
+    return result, last["deltas"], tool_events, schema_error
+
+
+async def _day6_stream_with_retry(agent, prompt, context, session, model, adapter, make_repair, report, run_dir):
+    """主工具任务只执行一次；最多用无工具 Agent 纠正一次最终回答。
+
+    adapter 提供 validate_output/collect_stream；make_repair(raw, error) 返回
+    (纠错 Agent, 纠错 Prompt, 流式模型)。report 原地记录次数、错误及实际累计 usage。
+    返回 (四字段回答字典, 归一化事件列表)，失败则保留尝试记录并抛出异常。
+    """
+    tool_events, total_usage = [], {key: 0 for key in (
+        "requests", "input_tokens", "output_tokens", "total_tokens",
+    )}
+    report.update(tool_workflow_runs=1, retry_count=0, output_errors=[])
+    for attempt in range(2):
+        result, deltas, notifications, schema_error = await _day6_stream_attempt(
+            agent, prompt, context, session, model, timeout=600 if attempt == 0 else 120,
+        )
+        tool_events.extend(notifications)
+        # 主任务 usage 已包含专家，不能再次累加专家结果；独立纠错再加一次。
+        usage = result.context_wrapper.usage
+        for key in total_usage:
+            total_usage[key] += getattr(usage, key)
+        report["usage"] = dict(total_usage)
+        raw = "".join(event["data"] for event in deltas)
+        try:
+            output = adapter["validate_output"](raw)
+        except ValueError as exc:
+            report["output_errors"].append(str(exc))
+            _save_debug_json(Path(run_dir) / f"attempt_{attempt + 1}_events.json", [
+                *notifications, *deltas, {"type": "error", "message": str(exc)},
+            ])
+            if attempt == 1:
+                raise ValueError("最终回答纠错一次后仍不合法") from exc
+            agent, prompt, model = make_repair(raw, str(exc))
+            if agent.tools or agent.mcp_servers:
+                raise ValueError("纠错 Agent 必须没有工具和 MCP 服务")
+            report["retry_count"] = 1
+            # 使用全新的独立上下文，不带主任务 Session，不重复工具流程。
+            context, session = None, None
+            continue
+        if schema_error is not None:
+            # 文本本身合格时，SDK 异常并非输出格式错误，不能吞掉。
+            raise schema_error
+        if output != result.final_output.model_dump():
+            raise ValueError("真实增量与 SDK 最终结构化结果不一致")
+        events = [*tool_events, *deltas, {"type": "completed", "usage": dict(total_usage)}]
+        collected = adapter["collect_stream"](iter(events))
+        if collected != {"output": output, "usage": total_usage}:
+            raise ValueError("流式适配结果与最终回答或实际 usage 不一致")
+        _save_debug_json(Path(run_dir) / f"attempt_{attempt + 1}_events.json", [
+            *notifications, *deltas, {"type": "completed", "usage": dict(total_usage)},
+        ])
+        return output, events
+
+
+@pytest.mark.skipif(
+    os.environ.get("RUN_DAY6_STREAM_TEST") != "1",
+    reason="测试五真实流式验证需显式设置 RUN_DAY6_STREAM_TEST=1",
+)
+@pytest.mark.asyncio
+async def test_day6_stream_real_llm():
+    """测试五：真实流、至多一次无工具纠错、实际 usage 和独立业务验收。
+
+    数据来自 Day6 的 task 模板，事件来自实际 DeepSeek SDK 流，不使用离线
+    stream_cases.json 冒充真实事件。需要 Docker 和 agent-python:3.10 镜像。
+    默认跳过；即使直接调用也检查开关。只有本测试注入场景提示，不修改通用提示词。
+    """
+    if os.environ.get("RUN_DAY6_STREAM_TEST") != "1":
+        pytest.skip("请先显式启用测试五真实流式验证")
+    assert os.environ.get("OPENAI_API_KEY"), "缺少现有 DeepSeek 配置 OPENAI_API_KEY"
+    from agents import OpenAIResponsesModel
+    from agentPrompts import SUPERVISOR_INSTRUCTIONS, PYTHON_EXPERT_INSTRUCTIONS, PYTHON_EXPERT_DESCRIPTION
+    from baseModel import AgentInput, AgentOutput, build_prompt
+    from tools import EvalContext
+
+    case_dir = _DAY6_WORKSPACE
+    manifest = json.loads((case_dir / "eval_tests/manifest.json").read_text(encoding="utf-8"))
+    assert _file_hashes(case_dir / "task/workspace") == manifest["workspace_hashes"]
+    assert _file_hashes(case_dir / "task/eval_tests") == manifest["test_hashes"]
+    adapter = runpy.run_path(str(case_dir / "exercise_adapter.py"))
+    logger_class = runpy.run_path(str(case_dir / "run_non_stream.py"))["ToolCallLogger"]
+    run_id = "stream_" + uuid.uuid4().hex[:12]
+    run_dir = case_dir / "runs" / run_id
+    task_root = run_dir / "task"
+    shutil.copytree(case_dir / "task", task_root)
+    tool_log = logger_class(run_dir / "tool_calls.jsonl")
+    session = SQLiteSession(run_id, str(run_dir / "session.db"))
+    report = {
+        "mode": "real_llm", "response_mode": "stream", "status": "failed", "error": None,
+        "usage": None, "retry_count": 0, "tool_workflow_runs": 0,
+    }
+    started, client, lite = time.perf_counter(), None, None
+    try:
+        task = AgentInput(
+            goal="修复 workspace/src/report.py 的筛选逻辑，并运行固定测试。",
+            workspace="workspace",
+            constraints=[
+                "Python 3.10，只允许修改 workspace/src/report.py，不新增依赖。",
+                "engineCode 精确等于 engine_code 且 status 精确等于 done。",
+                "保持输入顺序、不修改输入记录，保持函数签名及报表字段。",
+                "workspace/data 和 eval_tests 只读，只访问本次 task 授权目录。",
+            ],
+            verification="调用 runSafeTest，project_path=workspace，test_path=eval_tests，报告实际结果。",
+        )
+        prompt = build_prompt(task)
+        _save_debug_json(run_dir / "task_input.json", task.model_dump())
+        (run_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
+        with patch.dict(os.environ, {"THREAD_ID": run_id}):
+            lite = agentLite.AgentLite(session=session)
+        client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"], base_url="https://api.deepseek.com")
+        base_model = OpenAIResponsesModel(
+            model=os.environ.get("DAY6_TEST_MODEL", "deepseek-flash"), openai_client=client,
+        )
+        directory = (
+            f"\n工具授权根目录：{task_root}；项目相对目录 workspace；固定测试目录 eval_tests。"
+            "工具参数优先使用相对此根目录的路径，changed_files 相对项目目录。\n"
+        )
+        expert = Agent(
+            name="PythonExpert", model=base_model,
+            instructions=PYTHON_EXPERT_INSTRUCTIONS + directory,
+            tools=[tool_log.wrap(tool, "PythonExpert") for tool in lite._tools],
+        )
+        model = Day6StreamingModel(base_model, "Supervisor", run_dir / "sdk_events.jsonl")
+        supervisor = Agent(
+            name="Supervisor", model=model, output_type=AgentOutput,
+            instructions=SUPERVISOR_INSTRUCTIONS + directory,
+            tools=[tool_log.wrap(expert.as_tool(
+                tool_name="PythonExpert", tool_description=PYTHON_EXPERT_DESCRIPTION,
+                custom_output_extractor=agentLite._limited_expert_output,
+                failure_error_function=None, max_turns=30,
+            ), "Supervisor")],
+        )
+
+        def make_repair(raw, error):
+            records = [json.loads(line) for line in tool_log.path.read_text(encoding="utf-8").splitlines()]
+            actual_files = _file_hashes(task_root / "workspace")
+            before = manifest["workspace_hashes"]
+            facts = {
+                "goal": task.goal, "constraints": task.constraints,
+                "changed_files": sorted(name for name in before.keys() | actual_files.keys()
+                                        if before.get(name) != actual_files.get(name)),
+                "tool_results": [row for row in records if row["event"] == "tool_end"
+                                 and row["tool"] in ("applyPatch", "runSafeTest")],
+            }
+            repair_model = Day6StreamingModel(base_model, "OutputRepair", run_dir / "sdk_events.jsonl")
+            repair = Agent(
+                name="OutputRepair", model=repair_model, output_type=AgentOutput, tools=[],
+                instructions="只纠正最终回答的结构。依据提供的实际执行事实，不改变测试结果或虚构执行。"
+                             "按程序 Schema 输出，不添加围栏；无法完成的事项如实保留。",
+            )
+            repair_prompt = json.dumps({"actual_facts": facts, "invalid_output": raw, "validation_error": error}, ensure_ascii=False)
+            _save_debug_json(run_dir / "repair_input.json", json.loads(repair_prompt))
+            return repair, repair_prompt, repair_model
+
+        answer, events = await _day6_stream_with_retry(
+            supervisor, prompt, EvalContext(workspace=task_root), session, model,
+            adapter, make_repair, report, run_dir,
+        )
+        _save_debug_json(run_dir / "answer.json", answer)
+        _save_debug_json(run_dir / "events.json", events)
+        report["status"] = "completed"
+    except BaseException as exc:
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        _save_debug_json(run_dir / "events.json", [{"type": "error", "message": report["error"]}])
+        raise
+    finally:
+        report["elapsed_seconds"] = time.perf_counter() - started
+        try:
+            _save_debug_json(run_dir / "run_report.json", report)
+            _save_debug_json(run_dir / "session_after.json", {"items": await session.get_items()})
+            print(f"Day6 测试五产物：{run_dir}")
+        finally:
+            session.close()
+            if lite is not None:
+                await lite.close()
+            if client is not None:
+                await client.close()
+
+    # 独立检查器读取自己的原始测试，不把参考答案交给 Agent。
+    checked = await asyncio.to_thread(
+        subprocess.run,
+        [sys.executable, "-B", str(case_dir / "check_real_run.py"), "--mode", "stream",
+         "--repo", str(Path(__file__).resolve().parents[1]), "--run-dir", str(run_dir),
+         "--adapter", str(case_dir / "exercise_adapter.py")],
+        capture_output=True, text=True, timeout=60,
+    )
+    evaluation = json.loads(checked.stdout)
+    _save_debug_json(run_dir / "evaluation.json", evaluation)
+    assert checked.returncode == 0 and evaluation["passed"], evaluation
+
+
+@pytest.mark.parametrize("scenario", [
+    "valid", "repair", "still_invalid", "tool_error", "disconnect", "missing_usage", "no_delta",
+])
+@pytest.mark.asyncio
+async def test_day6_stream_support_offline(tmp_path, monkeypatch, scenario):
+    """真实 SDK + 预设模型流验证测试五辅助逻辑，不访问网络或启动 Docker。
+
+    检查正常流、纠错、停止、工具错误、断流、用量缺失和无真实增量；主工具只执行一次。
+    """
+    from agents import function_tool, set_tracing_disabled
+    from agents.tracing import setup as tracing_setup
+    from agents.tracing.provider import DefaultTraceProvider
+    from openai.types.responses import (
+        Response, ResponseCompletedEvent, ResponseFunctionToolCall,
+        ResponseOutputMessage, ResponseOutputText, ResponseTextDeltaEvent, ResponseUsage,
+    )
+    from baseModel import AgentOutput
+    from tools import FatalToolError
+
+    monkeypatch.setattr(tracing_setup, "GLOBAL_TRACE_PROVIDER", DefaultTraceProvider())
+    set_tracing_disabled(True)
+    adapter = runpy.run_path(str(_DAY6_WORKSPACE / "exercise_adapter.py"))
+    valid = AgentOutput(
+        summary="离线流验证完成", changed_files=[], test_status="not_run", unfinished_work=[],
+    ).model_dump_json()
+    calls, repairs = [], []
+
+    @function_tool(failure_error_function=None)
+    async def localWork() -> str:
+        calls.append("executed")
+        if scenario == "tool_error":
+            raise FatalToolError("离线模拟工具失败")
+        return '{"success":true,"summary":"工具文本不能拼进最终回答"}'
+
+    class OfflineStreamModel(Model):
+        def __init__(self, responses):
+            self.responses = iter(responses)
+            self.calls = 0
+
+        async def get_response(self, *args, **kwargs):
+            raise AssertionError("本测试必须调用真实 SDK 流式路径")
+
+        async def stream_response(self, *args, **kwargs):
+            self.calls += 1
+            payload = next(self.responses)
+            if isinstance(payload, Exception):
+                raise payload
+            output = []
+            if payload == "tool":
+                # Supervisor 的中间说明也不是最终回答，不应与最后一轮文本混合。
+                yield ResponseTextDeltaEvent(
+                    type="response.output_text.delta", content_index=0, output_index=0,
+                    item_id="planning", delta="准备调用工具", sequence_number=0, logprobs=[],
+                )
+                output = [ResponseOutputMessage(
+                    id="planning", role="assistant", type="message", status="completed",
+                    content=[ResponseOutputText(type="output_text", text="准备调用工具", annotations=[])],
+                ), ResponseFunctionToolCall(
+                    id="call_1", call_id="call_1", type="function_call", name="localWork", arguments="{}",
+                )]
+            else:
+                # 这些是明确标注的离线模拟事件，真实入口不会切分最终回答来伪造流。
+                for index, chunk in enumerate((payload[:7], payload[7:])):
+                    if scenario == "no_delta":
+                        continue
+                    yield ResponseTextDeltaEvent(
+                        type="response.output_text.delta", content_index=0, output_index=0,
+                        item_id="message_1", delta=chunk, sequence_number=index, logprobs=[],
+                    )
+                output = [ResponseOutputMessage(
+                    id="message_1", role="assistant", type="message", status="completed",
+                    content=[ResponseOutputText(type="output_text", text=payload, annotations=[])],
+                )]
+            response = Response.model_construct(
+                id=f"response_{self.calls}", object="response", created_at=0, model="offline",
+                status="completed", output=output,
+                usage=None if scenario == "missing_usage" and payload != "tool" else ResponseUsage(
+                    input_tokens=10, output_tokens=5, total_tokens=15,
+                    input_tokens_details={"cached_tokens": 0, "cache_write_tokens": 0},
+                    output_tokens_details={"reasoning_tokens": 0},
+                ),
+            )
+            yield ResponseCompletedEvent(type="response.completed", response=response, sequence_number=3)
+
+    raw_model = OfflineStreamModel([
+        "tool", ConnectionError("离线模拟断流") if scenario == "disconnect"
+        else valid if scenario in ("valid", "missing_usage", "no_delta") else '{"summary":',
+    ])
+    model = Day6StreamingModel(raw_model, "Supervisor", tmp_path / "sdk_events.jsonl")
+    agent = Agent(name="Supervisor", model=model, output_type=AgentOutput, tools=[localWork])
+    repair_model = None
+
+    def make_repair(raw, error):
+        nonlocal repair_model
+        repairs.append({"raw": raw, "error": error})
+        repair_model = OfflineStreamModel(["[]" if scenario == "still_invalid" else valid])
+        wrapped = Day6StreamingModel(repair_model, "OutputRepair", tmp_path / "sdk_events.jsonl")
+        repair = Agent(name="OutputRepair", model=wrapped, output_type=AgentOutput, tools=[])
+        return repair, json.dumps(repairs[-1]), wrapped
+
+    report = {}
+    if scenario in ("still_invalid", "tool_error", "disconnect", "missing_usage", "no_delta"):
+        error_type = {"tool_error": FatalToolError, "disconnect": ConnectionError}.get(scenario, ValueError)
+        with pytest.raises(error_type):
+            await _day6_stream_with_retry(agent, "离线任务", None, None, model, adapter, make_repair, report, tmp_path)
+    else:
+        output, events = await _day6_stream_with_retry(
+            agent, "离线任务", None, None, model, adapter, make_repair, report, tmp_path,
+        )
+        assert output == json.loads(valid)
+        assert adapter["collect_stream"](iter(events)) == {"output": output, "usage": report["usage"]}
+        assert report["usage"] == {
+            "requests": 2 if scenario == "valid" else 3,
+            "input_tokens": 20 if scenario == "valid" else 30,
+            "output_tokens": 10 if scenario == "valid" else 15,
+            "total_tokens": 30 if scenario == "valid" else 45,
+        }
+    assert calls == ["executed"]
+    expected_repairs = int(scenario in ("repair", "still_invalid"))
+    assert len(repairs) == expected_repairs
+    assert report["retry_count"] == expected_repairs
+    assert report["tool_workflow_runs"] == 1
+    if repair_model:
+        assert repair_model.calls == 1
+        raw_records = [json.loads(line) for line in (tmp_path / "sdk_events.jsonl").read_text(encoding="utf-8").splitlines()]
+        assert all(row["tools"] == [] for row in raw_records
+                   if row["kind"] == "model_request" and row["agent"] == "OutputRepair")
+
+
 @pytest.mark.parametrize("problem,failed_check", [
     ("old_history", "first_model_input_is_compacted_history_plus_one_prompt"),
     ("split_prompt", "first_model_input_is_compacted_history_plus_one_prompt"),

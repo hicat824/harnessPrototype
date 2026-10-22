@@ -27,6 +27,7 @@ from agentPrompts import (
     CPP_EXPERT_DESCRIPTION,
     CPP_EXPERT_INSTRUCTIONS,
 )
+from baseModel import AgentOutput
 from typing import Optional
 import openai
 import uuid
@@ -106,6 +107,13 @@ async def _limited_expert_output(run_result):
     )
 
 
+def _final_output_text(output) -> str:
+    """结构化结论转为 JSON，供控制台和现有调试文件继续按文本处理。"""
+    if isinstance(output, AgentOutput):
+        return output.model_dump_json()
+    return str(output)
+
+
 class AgentLite:
     def __init__(self, session=None):
         self._client = None
@@ -181,6 +189,8 @@ class AgentLite:
             name="Supervisor",
             model=model,
             instructions=SUPERVISOR_INSTRUCTIONS,
+            # 只约束 Supervisor 的最终回答，专家仍返回原有文本结论。
+            output_type=AgentOutput,
             tools=[
                 self._python_agent.as_tool(
                     tool_name="PythonExpert",
@@ -212,6 +222,7 @@ class AgentLite:
         """执行一次请求，仍返回 bool；调试时额外收集结论、usage 和错误。
 
         debug_info 由调用方提供，便于测试保存结果；调试请求禁用远程 tracing。
+        final_output 保持文本格式，结构化结论保存为 JSON 文本。
         max_turns 未指定时沿用 SDK 默认值。历史选择由调用方在请求前完成。
         """
         if debug_info is not None:
@@ -229,11 +240,12 @@ class AgentLite:
                 if debug_info is not None:
                     run_options["run_config"] = RunConfig(tracing_disabled=True)
                 response = await Runner.run(self._client, prompt, **run_options)
-                print(f"answer = {response.final_output}")
+                final_output = _final_output_text(response.final_output)
+                print(f"answer = {final_output}")
 
                 usage = response.context_wrapper.usage
                 if debug_info is not None:
-                    debug_info["final_output"] = response.final_output
+                    debug_info["final_output"] = final_output
                     debug_info["usage"] = {
                         "requests": usage.requests,
                         "input_tokens": usage.input_tokens,
@@ -282,7 +294,7 @@ class AgentLite:
                 try:
                     response = await Runner.run(self._client, prompt, session=self._session,
                                                 context=EvalContext())
-                    print(f"answer = {response.final_output}")
+                    print(f"answer = {_final_output_text(response.final_output)}")
 
                     usage = response.context_wrapper.usage
                     print("请求次数:", usage.requests)
@@ -331,7 +343,7 @@ class AgentLite:
                 try:
                     response = Runner.run_sync(self._client, prompt, session=self._session,
                                                context=EvalContext())
-                    print(response.final_output)
+                    print(_final_output_text(response.final_output))
                 except FatalToolError as e:
                     print(f"工具调用失败：{e}")
 
@@ -351,6 +363,6 @@ class AgentLite:
                                            auto_previous_response_id=True,
                                            context=EvalContext())
                 previous_response_id = response.last_response_id
-                print(response.final_output)
+                print(_final_output_text(response.final_output))
             except FatalToolError as e:
                 print(f"工具调用失败：{e}")
