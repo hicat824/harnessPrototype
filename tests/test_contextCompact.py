@@ -1337,3 +1337,566 @@ async def test_day5_final_test():
                 await lite.close()
             if client is not None:
                 await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    os.environ.get("RUN_DAY7_TEST1") != "1",
+    reason="Day7 真实历史摘要验收需显式设置 RUN_DAY7_TEST1=1",
+)
+async def test_day7_test1_fixed():
+    """检查短历史、全量对照和摘要后选择；本测试不执行 Bug 修复任务。
+
+    输入：Day7 inputs 中的短历史、长历史与预算配置，历史只加载 items。
+    输出：独立运行目录下的三个 history_after 文件、压缩记录和验收报告。
+    managed 组调用真实摘要 LLM；未显式启用时跳过，异常时保留已有产物。
+    """
+    # 直接调用函数时也遵守真实 LLM 的显式启用条件。
+    if os.environ.get("RUN_DAY7_TEST1") != "1":
+        pytest.skip("请先显式启用 RUN_DAY7_TEST1=1")
+
+    case_dir = Path("/media/xumaozhou/data/AI/local_agent_test/week5_day7_context_comparison")
+    run_id = "run_fixed_" + uuid.uuid4().hex[:12]
+    run_dir = case_dir / "runs" / run_id
+    baseline_dir = run_dir / "baseline"
+    managed_dir = run_dir / "managed"
+    # SQLite 不会创建父目录，必须在初始化 Session 之前准备好目录。
+    run_dir.mkdir(parents=True, exist_ok=False)
+    baseline_dir.mkdir()
+    managed_dir.mkdir()
+
+    config = json.loads((case_dir / "inputs/comparison_config.json").read_text(encoding="utf-8"))
+    check_context = runpy.run_path(str(case_dir / "check_context.py"))["check_context"]
+    report = {"passed": False, "run_id": run_id, "checks": {}}
+    small_session = None
+    managed_session = None
+
+    try:
+        # 1. 短历史：未超预算时直接返回，不调用摘要函数。
+        small_items = json.loads(
+            (case_dir / "inputs/small_history.json").read_text(encoding="utf-8")
+        )["items"]
+        small_session = SQLiteSession(run_id + "_small", str(run_dir / "small_session.db"))
+        await small_session.add_items(small_items)
+        small_selected = await select_history(
+            session=small_session,
+            recent_turns=config["keep_recent_turns"],
+            history_tokens_thre=config["selection_threshold_estimated_tokens"],
+        )
+        _save_debug_json(run_dir / "small_history_after.json", {"items": small_selected})
+        report["checks"]["small_history_unchanged"] = small_selected == small_items
+        report["checks"]["small_session_unchanged"] = await small_session.get_items() == small_items
+        assert report["checks"]["small_history_unchanged"], "短历史选择后发生变化"
+        assert report["checks"]["small_session_unchanged"], "select_history 不应修改 Session"
+
+        # 2. baseline：原样复制长历史，并独立检查输出 items。
+        history_path = case_dir / "inputs/session_history.json"
+        original_items = json.loads(history_path.read_text(encoding="utf-8"))["items"]
+        baseline_output = baseline_dir / "history_after.json"
+        shutil.copyfile(history_path, baseline_output)
+        baseline_items = json.loads(baseline_output.read_text(encoding="utf-8"))["items"]
+        report["baseline"] = check_context(original_items, baseline_items, "baseline")
+        _save_debug_json(baseline_dir / "context_check.json", report["baseline"])
+        report["checks"]["baseline_context_passed"] = report["baseline"]["passed"]
+        assert report["checks"]["baseline_context_passed"], report["baseline"]
+
+        # 3. managed：先摘要以保留旧事实，再选择下一次请求使用的历史。
+        managed_session = SQLiteSession(
+            run_id + "_managed", str(managed_dir / "managed_session.db"),
+        )
+        await managed_session.add_items(original_items)
+        compact_result = await compact_session(
+            session=managed_session,
+            summarize_fn=summarize_history,
+            threshold=config["compact_threshold_estimated_tokens"],
+            keep_recent_turns=config["keep_recent_turns"],
+            reserved_tokens=config["reserved_estimated_tokens"],
+        )
+        # 压缩失败也先保存原因和 Session 快照，再让断言报错。
+        report["compaction"] = compact_result
+        _save_debug_json(managed_dir / "compaction.json", compact_result)
+        _save_debug_json(
+            managed_dir / "compacted_history.json", {"items": await managed_session.get_items()},
+        )
+        report["checks"]["history_compacted"] = compact_result["compacted"]
+        assert compact_result["compacted"], compact_result
+
+        managed_selected = await select_history(
+            session=managed_session,
+            recent_turns=config["keep_recent_turns"],
+            history_tokens_thre=config["selection_threshold_estimated_tokens"],
+        )
+        _save_debug_json(managed_dir / "history_after.json", {"items": managed_selected})
+        # 复用夹具检查器，覆盖摘要位置、最近两轮、工具配对、来源和字符预算。
+        report["managed"] = check_context(original_items, managed_selected, "managed")
+        _save_debug_json(managed_dir / "context_check.json", report["managed"])
+        report["checks"]["managed_context_passed"] = report["managed"]["passed"]
+        assert report["checks"]["managed_context_passed"], report["managed"]
+        report["passed"] = all(report["checks"].values())
+    except Exception as exc:
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        try:
+            _save_debug_json(run_dir / "report.json", report)
+            print(f"Day7 测试一产物：{run_dir}")
+        finally:
+            if small_session is not None:
+                small_session.close()
+            if managed_session is not None:
+                managed_session.close()
+
+
+_DAY7_ROOT = Path("/media/xumaozhou/data/AI/local_agent_test/week5_day7_context_comparison")
+_DAY7_USAGE_FIELDS = ("requests", "input_tokens", "output_tokens", "total_tokens")
+
+
+def _day7_usage(records, stage):
+    """汇总指定阶段每次 SDK 模型调用的实际 usage；有调用缺失用量时返回 None。
+
+    records 是模型记录器的条目列表，stage 为 summary 或 continuation。
+    没有请求时返回四项全 0；不把专家用量再加到顶层聚合 usage 上。
+    """
+    rows = [row for row in records if row["stage"] == stage]
+    if any(row.get("usage") is None for row in rows):
+        return None
+    return {key: sum(row["usage"][key] for row in rows) for key in _DAY7_USAGE_FIELDS}
+
+
+class Day7RecordingModel(RecordingModel):
+    """记录每次真实非流式调用的输入和返回用量，立即落盘以保留失败证据。"""
+
+    def __init__(self, model, agent_name, requests, path, stage):
+        super().__init__(model, agent_name, requests)
+        self.path, self.stage = path, stage
+
+    async def get_response(self, *args, **kwargs):
+        # 当前 SDK 用关键字传参；兼容 Model 接口的位置参数，避免记录器改变调用方式。
+        model_input = kwargs["input"] if "input" in kwargs else args[1]
+        tools = kwargs["tools"] if "tools" in kwargs else args[3]
+        instructions = kwargs.get("system_instructions", args[0] if args else None)
+        record = {
+            "request_id": len(self.requests) + 1, "agent": self.agent_name,
+            "stage": self.stage, "input": copy.deepcopy(model_input),
+            "instructions": instructions,
+            "tools": [{"name": tool.name, "schema": tool.params_json_schema} for tool in tools],
+        }
+        self.requests.append(record)
+        _day6_append_event(self.path, {"event": "model_request", **record})
+        started = time.perf_counter()
+        try:
+            response = await self.model.get_response(*args, **kwargs)
+            record["usage"] = {key: getattr(response.usage, key) for key in _DAY7_USAGE_FIELDS}
+            record["seconds"] = time.perf_counter() - started
+            _day6_append_event(self.path, {"event": "model_response", **record})
+            return response
+        except BaseException as exc:
+            record["error"] = f"{type(exc).__name__}: {exc}"
+            _day6_append_event(self.path, {"event": "model_error", **record})
+            raise
+
+    def get_retry_advice(self, request):
+        return self.model.get_retry_advice(request)
+
+
+async def _day7_run_group(group_dir, group, config):
+    """运行一组真实续接，输入为 prepare_runs 创建的组目录、组名和配置。
+
+    输出为 run_report 字典，同时保存历史、实际请求、工具日志和独立 pytest 结果。
+    baseline 全量保留；managed 先真实摘要再选择。只有 task 副本授权给工具，
+    专家不共享 Supervisor 的 Session。执行失败保存证据后抛出，不重放修复任务。
+    """
+    from agents import OpenAIResponsesModel, RunConfig, Runner
+    from agentLite import AgentLite, _limited_expert_output
+    from agentPrompts import (
+        HISTORY_SUMMARY_INSTRUCTIONS, SUPERVISOR_INSTRUCTIONS,
+        PYTHON_EXPERT_INSTRUCTIONS, PYTHON_EXPERT_DESCRIPTION,
+    )
+    from baseModel import AgentInput, AgentOutput, build_prompt
+    from tools import EvalContext
+    import xml.etree.ElementTree as ET
+
+    metadata = json.loads((group_dir / "run_metadata.json").read_text(encoding="utf-8"))
+    report = json.loads((_DAY7_ROOT / "templates/group_report.json").read_text(encoding="utf-8"))
+    report.update(group=group, model=config["model"], status="failed", checks={}, output_correction_count=0)
+    records, debug = [], {}
+    task_root = group_dir / "task"
+    workspace = task_root / "workspace"
+    original_task = _file_hashes(task_root)
+    original_fixture = _file_hashes(_DAY7_ROOT / "task")
+    session = SQLiteSession(metadata["session_id"], str(group_dir / "session.db"))
+    client, lite = None, None
+    context_started, continuation_started = None, None
+    report["summary_seconds"] = 0.0
+
+    try:
+        assert group in ("baseline", "managed")
+        assert config["provider"] == "DeepSeek" and config["response_mode"] == "non_stream"
+        client = AsyncOpenAI(
+            api_key=os.environ["OPENAI_API_KEY"], base_url="https://api.deepseek.com", timeout=90,
+        )
+        path = group_dir / "model_requests.jsonl"
+        path.touch(exist_ok=False)
+        summary_model = Day7RecordingModel(
+            OpenAIChatCompletionsModel(model=config["model"], openai_client=client),
+            "HistorySummaryAgent", records, path, "summary",
+        )
+
+        async def summarize_and_record(old_history):
+            """接收旧历史 JSON，返回 compact_session 需要的 {summary, tokens}。"""
+            _save_debug_json(group_dir / "summary_input.json", {"items": json.loads(old_history)})
+            started = time.perf_counter()
+            try:
+                result = await Runner.run(
+                    Agent(name="HistorySummaryAgent", instructions=HISTORY_SUMMARY_INSTRUCTIONS,
+                          model=summary_model),
+                    old_history, max_turns=1, run_config=RunConfig(tracing_disabled=True),
+                )
+                summary = result.final_output
+                if not isinstance(summary, str) or not summary.strip():
+                    raise ValueError("摘要模型未返回有效文本")
+                (group_dir / "summary.txt").write_text(summary.strip(), encoding="utf-8")
+                return {"summary": summary.strip(), "tokens": result.context_wrapper.usage.total_tokens}
+            finally:
+                report["summary_seconds"] += time.perf_counter() - started
+
+        context_started = time.perf_counter()
+        before = json.loads((group_dir / "history_before.json").read_text(encoding="utf-8"))["items"]
+        await session.add_items(before)
+        selected = copy.deepcopy(before)
+        if group == "managed":
+            compaction = await asyncio.wait_for(compact_session(
+                session, summarize_and_record,
+                threshold=config["compact_threshold_estimated_tokens"],
+                keep_recent_turns=config["keep_recent_turns"],
+                reserved_tokens=config["reserved_estimated_tokens"],
+            ), timeout=180)
+            _save_debug_json(group_dir / "compaction.json", compaction)
+            assert compaction["compacted"], compaction
+            selected = await select_history(
+                session, recent_turns=config["keep_recent_turns"],
+                history_tokens_thre=config["selection_threshold_estimated_tokens"],
+            )
+            # select_history 不写 Session；顺序替换，失败时恢复已压缩的历史。
+            compacted = await session.get_items()
+            if selected != compacted:
+                try:
+                    await session.clear_session()
+                    await session.add_items(selected)
+                except Exception:
+                    await session.clear_session()
+                    await session.add_items(compacted)
+                    raise
+        _save_debug_json(group_dir / "history_after.json", {"items": selected})
+        for label, items in (("before", before), ("after", selected)):
+            chars = len(json.dumps(items, ensure_ascii=False))
+            report[f"history_{label}_chars"] = chars
+            report[f"history_estimated_tokens_{label}"] = chars // 2
+        checker = runpy.run_path(str(_DAY7_ROOT / "check_context.py"))["check_context"]
+        context_check = checker(before, selected, group)
+        _save_debug_json(group_dir / "context_check.json", context_check)
+        report["context_checks_passed"] = context_check["passed"]
+        assert context_check["passed"], context_check
+        report["context_preparation_seconds"] = time.perf_counter() - context_started
+        context_started = None
+
+        task = AgentInput.model_validate_json((group_dir / "agent_input.json").read_text(encoding="utf-8"))
+        prompt = build_prompt(task)
+        (group_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
+        directory_info = (
+            f"\n本次工具授权根目录：{task_root}\n"
+            "项目相对目录：workspace；源码：workspace/src/report.py；数据：workspace/data/tasks.json；"
+            "固定测试目录：eval_tests。工具路径相对于授权根目录，changed_files 相对于项目目录；"
+            "例如工具修改 workspace/src/report.py，最终 changed_files 应填写 src/report.py，不含 workspace/ 前缀。\n"
+        )
+        # 保存消除副本路径差异后的设置，供测试三检查两组实验条件一致。
+        _save_debug_json(group_dir / "agent_settings.json", {
+            "provider": config["provider"], "model": config["model"],
+            "response_mode": "non_stream", "max_turns": 30,
+            "supervisor_instructions": SUPERVISOR_INSTRUCTIONS + directory_info.replace(str(task_root), "<TASK_ROOT>"),
+            "expert_instructions": PYTHON_EXPERT_INSTRUCTIONS + directory_info.replace(str(task_root), "<TASK_ROOT>"),
+            "state_memory_injection": [],
+        })
+        logger_type = runpy.run_path(str(
+            _DAY7_ROOT.parent / "week5_day6_structured_output/run_non_stream.py"
+        ))["ToolCallLogger"]
+        tool_log = logger_type(group_dir / "tool_calls.jsonl")
+        with patch.dict(os.environ, {"THREAD_ID": metadata["session_id"]}):
+            lite = AgentLite(session=session)
+        real_model = OpenAIResponsesModel(model=config["model"], openai_client=client)
+        models = {name: Day7RecordingModel(real_model, name, records, path, "continuation")
+                  for name in ("Supervisor", "PythonExpert")}
+        lite._python_agent = Agent(
+            name="PythonExpert", instructions=PYTHON_EXPERT_INSTRUCTIONS + directory_info,
+            model=models["PythonExpert"],
+            tools=[tool_log.wrap(tool, "PythonExpert") for tool in lite._tools],
+        )
+        lite._client = Agent(
+            name="Supervisor", instructions=SUPERVISOR_INSTRUCTIONS + directory_info,
+            model=models["Supervisor"], output_type=AgentOutput,
+            tools=[tool_log.wrap(lite._python_agent.as_tool(
+                tool_name="PythonExpert", tool_description=PYTHON_EXPERT_DESCRIPTION,
+                custom_output_extractor=_limited_expert_output, failure_error_function=None,
+                max_turns=30,
+            ), "Supervisor")],
+        )
+        continuation_started = time.perf_counter()
+        completed = await asyncio.wait_for(lite.simpleCallLLM(
+            prompt, EvalContext(workspace=task_root), debug_info=debug, max_turns=30,
+        ), timeout=600)
+        outer = [row for row in records if row["agent"] == "Supervisor"]
+        if outer:
+            _save_debug_json(group_dir / "first_model_input.json", {"input": outer[0]["input"]})
+            report["first_supervisor_input_tokens"] = outer[0].get("usage", {}).get("input_tokens")
+        report["history_in_actual_model_input"] = bool(outer) and outer[0]["input"] == [
+            *selected, {"role": "user", "content": prompt},
+        ]
+        assert completed, debug.get("error")
+        assert report["history_in_actual_model_input"], "实际模型输入不是选定历史加一条本轮 Prompt"
+        output = AgentOutput.model_validate_json(debug["final_output"])
+        workspace_before = {name.removeprefix("workspace/"): value for name, value in original_task.items()
+                            if name.startswith("workspace/")}
+        workspace_after = _file_hashes(workspace)
+        actual_files = sorted(name for name in workspace_before.keys() | workspace_after.keys()
+                              if workspace_before.get(name) != workspace_after.get(name))
+        # 只纠正可确认的目录前缀错误，不借评估答案补充遗漏的历史事实或改变测试状态。
+        if (output.changed_files != actual_files
+                and [name.removeprefix("workspace/") for name in output.changed_files] == actual_files):
+            original_output = output.model_dump()
+            repair_input = {"original_output": original_output, "actual_changed_files": actual_files}
+            _save_debug_json(group_dir / "output_repair_input.json", repair_input)
+            repair = await asyncio.wait_for(Runner.run(
+                Agent(
+                    name="OutputRepair", output_type=AgentOutput,
+                    instructions="仅纠正 changed_files 的项目相对路径格式，依据实际修改文件列表填写。"
+                    "summary、test_status、unfinished_work 必须与原输出完全一致。不调用工具。",
+                    model=Day7RecordingModel(real_model, "OutputRepair", records, path, "continuation"),
+                ),
+                json.dumps(repair_input, ensure_ascii=False), max_turns=1,
+                run_config=RunConfig(tracing_disabled=True),
+            ), timeout=120)
+            report["output_correction_count"] = 1
+            output = repair.final_output
+            assert all(output.model_dump()[key] == original_output[key]
+                       for key in ("summary", "test_status", "unfinished_work")), "路径纠错改变了其他结论"
+        report["continuation_seconds"] = time.perf_counter() - continuation_started
+        continuation_started = None
+        report["output_schema_valid"] = True
+        _save_debug_json(group_dir / "answer.json", output.model_dump())
+
+        # 独立使用评估者原始测试，而不是依赖模型宣称的 passed 或修改后的测试。
+        environment = dict(os.environ, PYTHONPATH=str(workspace), PYTHONDONTWRITEBYTECODE="1")
+        evaluation = await asyncio.to_thread(subprocess.run, [
+            sys.executable, "-B", "-m", "pytest", str(_DAY7_ROOT / "task/eval_tests/test_report.py"),
+            "-q", "-p", "no:cacheprovider", "--tb=short",
+            "--junitxml", str(group_dir / "fixed_tests.xml"),
+        ], cwd=workspace, env=environment, capture_output=True, text=True, timeout=60)
+        (group_dir / "fixed_tests.txt").write_text(evaluation.stdout + evaluation.stderr, encoding="utf-8")
+        cases = ET.parse(group_dir / "fixed_tests.xml").getroot().findall(".//testcase")
+        passed = sum(not any(case.find(tag) is not None for tag in ("failure", "error", "skipped"))
+                     for case in cases)
+        report["fixed_tests_exit_code"] = evaluation.returncode
+        report["fixed_tests_passed"] = passed
+        actual_task = {path: digest for path, digest in _file_hashes(task_root).items()
+                       if not path.startswith(".tool_results/")}
+        changed = sorted(path for path in original_task.keys() | actual_task.keys()
+                         if original_task.get(path) != actual_task.get(path))
+        report["changed_files"] = [path.removeprefix("workspace/") for path in changed]
+        report["protected_files_unchanged"] = changed == ["workspace/src/report.py"]
+        expected = json.loads((_DAY7_ROOT / "evaluator/expected.json").read_text(encoding="utf-8"))
+        report["handoff_tag_kept"] = expected["handoff_tag"] in output.summary
+        tool_events = [json.loads(line) for line in tool_log.path.read_text(encoding="utf-8").splitlines()]
+        test_results = [json.loads(row["output"]) for row in tool_events
+                        if row["event"] == "tool_end" and row["tool"] == "runSafeTest"]
+        report["checks"] = {
+            "independent_tests_passed": evaluation.returncode == 0 and passed == expected["business_test_count"],
+            "changed_files_match_disk": output.changed_files == report["changed_files"] == expected["allowed_changed_files"],
+            "protected_files_unchanged": report["protected_files_unchanged"],
+            "final_status_matches_tests": output.test_status == "passed" and output.unfinished_work == [],
+            "handoff_tag_kept": report["handoff_tag_kept"],
+            "agent_test_tool_actually_passed": any(
+                row.get("status") == "passed" and row.get("exit_code") == 0 for row in test_results
+            ),
+            # 输出纠错是独立运行，原 AgentLite 的聚合 usage 不包含它。
+            "usage_matches_sdk_aggregate": _day7_usage(
+                [row for row in records if row["agent"] != "OutputRepair"], "continuation",
+            ) == debug.get("usage"),
+        }
+        assert all(report["checks"].values()), report["checks"]
+        report["status"] = "completed"
+    except BaseException as exc:
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        if context_started is not None:
+            report["context_preparation_seconds"] = time.perf_counter() - context_started
+        if continuation_started is not None:
+            report["continuation_seconds"] = time.perf_counter() - continuation_started
+        report["summary_usage"] = _day7_usage(records, "summary")
+        report["continuation_usage"] = _day7_usage(records, "continuation")
+        if report["summary_usage"] is not None and report["continuation_usage"] is not None:
+            report["total_usage"] = {key: report["summary_usage"][key] + report["continuation_usage"][key]
+                                     for key in _DAY7_USAGE_FIELDS}
+        if report["context_preparation_seconds"] is not None and report["continuation_seconds"] is not None:
+            report["total_seconds"] = report["context_preparation_seconds"] + report["continuation_seconds"]
+        report["source_fixture_unchanged"] = _file_hashes(_DAY7_ROOT / "task") == original_fixture
+        if not report["source_fixture_unchanged"]:
+            report.update(status="failed", error="原始业务夹具发生变化")
+        try:
+            _save_debug_json(group_dir / "session_after.json", {"items": await session.get_items()})
+            _save_debug_json(group_dir / "debug.json", debug)
+            _save_debug_json(group_dir / "run_report.json", report)
+            print(f"Day7 {group} 产物：{group_dir}", flush=True)
+        finally:
+            session.close()
+            if lite is not None:
+                await lite.close()
+            if client is not None:
+                await client.close()
+    return report
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(
+    os.environ.get("RUN_DAY7_TEST2") != "1",
+    reason="Day7 真实 A/B 验收需显式设置 RUN_DAY7_TEST2=1",
+)
+async def test_day7_test2():
+    """创建相同起点的两组副本，真实修复续接并保存实际成本与独立验收结果。"""
+    if os.environ.get("RUN_DAY7_TEST2") != "1":
+        pytest.skip("请显式启用 RUN_DAY7_TEST2=1")
+    assert os.environ.get("OPENAI_API_KEY"), "缺少现有 DeepSeek 的 OPENAI_API_KEY 配置"
+    prepare_pair = runpy.run_path(str(_DAY7_ROOT / "prepare_runs.py"))["prepare_pair"]
+    pair = prepare_pair()
+    pointer = _DAY7_ROOT / "runs/latest_pair.json"
+    _save_debug_json(pointer, {"pair_dir": str(pair), "status": "running"})
+    config = json.loads((pair / "comparison_config.json").read_text(encoding="utf-8"))
+    failures = {}
+    try:
+        for group in ("baseline", "managed"):
+            # 一组失败也保留另一组实际结果，不能只挑选成功的组生成报告。
+            try:
+                row = await _day7_run_group(pair / group, group, config)
+                assert row["status"] == "completed" and row["source_fixture_unchanged"], row
+            except Exception as exc:
+                failures[group] = f"{type(exc).__name__}: {exc}"
+        assert not failures, failures
+    finally:
+        _save_debug_json(pointer, {"pair_dir": str(pair), "status": "failed" if failures else "finished"})
+        _save_debug_json(pair / "pair_result.json", {"passed": not failures, "failures": failures})
+        print(f"Day7 A/B 本次运行目录：{pair}", flush=True)
+
+
+def _day7_build_comparison(pair, reports):
+    """输入为配对目录和两组实测报告，返回比较字典与 Markdown，不调用模型。
+
+    核对日志中的实际用量、成本加总和两组实验条件；失败或缺失指标时标记
+    不可比较并保留原因。报告生成成功不代表两组修复都成功。
+    """
+    def read(group, name):
+        return json.loads((pair / group / name).read_text(encoding="utf-8"))
+
+    baseline, managed = reports["baseline"], reports["managed"]
+    checks = {
+        "same_history": read("baseline", "history_before.json") == read("managed", "history_before.json"),
+        "same_prompt_input": read("baseline", "agent_input.json") == read("managed", "agent_input.json"),
+    }
+    settings = [pair / group / "agent_settings.json" for group in ("baseline", "managed")]
+    checks["same_agent_settings"] = all(path.exists() for path in settings) and (
+        read("baseline", "agent_settings.json") == read("managed", "agent_settings.json")
+    )
+    for group, report in reports.items():
+        log = pair / group / "model_requests.jsonl"
+        events = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()] if log.exists() else []
+        requests = {row["request_id"]: row for row in events if row["event"] == "model_request"}
+        for event in events:
+            if event["event"] == "model_response":
+                requests[event["request_id"]] = event
+        records = list(requests.values())
+        for stage in ("summary", "continuation"):
+            checks[f"{group}_{stage}_usage_matches_logs"] = report[f"{stage}_usage"] == _day7_usage(records, stage)
+        summary, continuation = report["summary_usage"], report["continuation_usage"]
+        if summary is not None and continuation is not None:
+            checks[f"{group}_total_usage_sum"] = report["total_usage"] == {
+                key: summary[key] + continuation[key] for key in _DAY7_USAGE_FIELDS
+            }
+            for stage in ("summary_usage", "continuation_usage", "total_usage"):
+                usage = report[stage]
+                checks[f"{group}_{stage}_valid"] = all(
+                    type(usage[key]) is int and usage[key] >= 0 for key in _DAY7_USAGE_FIELDS
+                ) and usage["total_tokens"] == usage["input_tokens"] + usage["output_tokens"]
+        if report["total_seconds"] is not None:
+            checks[f"{group}_total_seconds_sum"] = abs(report["total_seconds"] - (
+                report["context_preparation_seconds"] + report["continuation_seconds"]
+            )) < 1e-6
+        checks[f"{group}_source_fixture_unchanged"] = report["source_fixture_unchanged"]
+
+    comparable = all(checks.values()) and all(
+        row["status"] == "completed" and row["total_usage"] is not None
+        and row["total_seconds"] is not None for row in reports.values()
+    )
+    comparison = {"pair_dir": str(pair), "checks": checks, "comparable": comparable,
+                  "continuation_tokens_saved": None, "net_tokens_saved": None,
+                  "total_seconds_saved": None,
+                  "errors": {group: row["error"] for group, row in reports.items() if row["error"]}}
+    if comparable:
+        comparison.update(
+            continuation_tokens_saved=baseline["continuation_usage"]["total_tokens"] - managed["continuation_usage"]["total_tokens"],
+            net_tokens_saved=baseline["total_usage"]["total_tokens"] - managed["total_usage"]["total_tokens"],
+            total_seconds_saved=baseline["total_seconds"] - managed["total_seconds"],
+        )
+
+    def show(value):
+        return "未测或缺失" if value is None else json.dumps(value, ensure_ascii=False)
+
+    metrics = [
+        ("历史字符数：处理前", "history_before_chars"), ("历史字符数：处理后", "history_after_chars"),
+        ("历史估算Token：处理前", "history_estimated_tokens_before"),
+        ("历史估算Token：处理后", "history_estimated_tokens_after"),
+        ("首次Supervisor实际input_tokens", "first_supervisor_input_tokens"),
+        ("摘要实际usage", "summary_usage"), ("续接实际usage（含专家）", "continuation_usage"),
+        ("含摘要成本的总usage", "total_usage"), ("摘要耗时（秒）", "summary_seconds"),
+        ("Context准备耗时（含摘要，秒）", "context_preparation_seconds"),
+        ("续接耗时（秒）", "continuation_seconds"), ("总耗时（秒）", "total_seconds"),
+        ("独立业务测试通过数/7", "fixed_tests_passed"), ("实际修改文件", "changed_files"),
+        ("历史进入真实模型请求", "history_in_actual_model_input"),
+        ("输出Schema校验", "output_schema_valid"), ("交接口令保留", "handoff_tag_kept"),
+        ("只修改授权文件", "protected_files_unchanged"), ("执行状态", "status"), ("错误", "error"),
+    ]
+    lines = ["# Week5 Day7：Context 使用对比报告", "", f"运行目录：`{pair}`", "",
+             "模型：" + show(baseline["model"]) + "；非流式。每组独立项目副本和 Session，固定8轮构造历史。",
+             "两组使用相同Prompt、Instructions与工具配置，不额外注入State/Memory。",
+             "历史Token按JSON字符数//2估算；实际usage来自模型返回，摘要成本计入总量。", "",
+             "| 指标 | baseline全量 | managed摘要＋选择 |", "| --- | --- | --- |"]
+    lines.extend(f"| {label} | {show(baseline[key])} | {show(managed[key])} |" for label, key in metrics)
+    lines.extend(["", "## 比较结论", "", f"是否可比较：{comparable}。",
+                  f"续接节省Token：{show(comparison['continuation_tokens_saved'])}。",
+                  f"包含摘要成本后的净节省Token：{show(comparison['net_tokens_saved'])}。",
+                  f"总耗时节省秒数：{show(comparison['total_seconds_saved'])}。",
+                  "正数表示managed减少，负数表示成本增加；不设必须节省的比例。",
+                  "这是单次观察，模型工具调用次数与生成长度也会影响总成本，不能据此推断稳定成功率。",
+                  "若未完成或缺少实际用量，不计算净收益，需先检查错误和原始日志。", "",
+                  "## 证据", "",
+                  "两组目录中的history_after.json、first_model_input.json、model_requests.jsonl、",
+                  "tool_calls.jsonl、answer.json、fixed_tests.txt、run_report.json。",
+                  "逐项一致性检查见comparison.json；固定测试耗时不计入Agent续接耗时。", ""])
+    return comparison, "\n".join(lines)
+
+
+def test_day7_test3():
+    """读取指定或最近一次 Day7 A/B 产物，核对实际成本并生成对比报告；不调用 LLM。"""
+    specified = os.environ.get("DAY7_PAIR_DIR")
+    if specified:
+        pair = Path(specified).expanduser().resolve()
+    else:
+        pointer = _DAY7_ROOT / "runs/latest_pair.json"
+        if not pointer.exists():
+            pytest.skip("请先运行 test_day7_test2，或通过 DAY7_PAIR_DIR 指定已有配对目录")
+        pair = Path(json.loads(pointer.read_text(encoding="utf-8"))["pair_dir"])
+    reports = {group: json.loads((pair / group / "run_report.json").read_text(encoding="utf-8"))
+               for group in ("baseline", "managed")}
+    comparison, markdown = _day7_build_comparison(pair, reports)
+    _save_debug_json(pair / "comparison.json", comparison)
+    (pair / "comparison_report.md").write_text(markdown, encoding="utf-8")
+    print(f"Day7 对比报告：{pair / 'comparison_report.md'}")
+    assert all(comparison["checks"].values()), comparison["checks"]
