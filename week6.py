@@ -334,6 +334,9 @@ def create_mcp_server(service: BusinessService) -> MCPServer:
 
     @mcp.tool()
     def query_task(task_id: str) -> BusinessResult:
+        """
+        通过任务ID查询相应的任务信息
+        """
         return service.query_task(task_id)
 
 
@@ -341,6 +344,9 @@ def create_mcp_server(service: BusinessService) -> MCPServer:
     def query_tasks_by_engine(engine_code: str, limit: Annotated[
         int, Field(strict=True, ge=1, le=100)
     ] = MAX_LIMIT) -> BusinessResult:
+        """
+        根据 engine code 和 limit 的组合查询指定个数指定类型的任务信息
+        """
         return service.query_tasks_by_engine(engine_code, limit)
 
     return mcp
