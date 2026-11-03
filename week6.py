@@ -1,11 +1,13 @@
-"""Week6 Day1～Day3：一个文件内完成只读业务查询练习。
+"""Week6 Day1～Day5：一个文件内完成只读业务查询练习。
 
-已提供：Day1 契约 / 合成数据、修正后的 Day2 HTTPX Client / MockTransport。
-需要自行实现（搜索 TODO(Day3)）：
-1. map_api_error：将 HTTP / 网络 / 响应格式错误转成统一结果。
-2. BusinessService.query_task：任务参数、读取权限校验和调用 Client。
-3. BusinessService.query_tasks_by_engine：流程参数、limit、权限校验和查询。
-4. create_mcp_server：通过 @mcp.tool() 注册两个只读查询工具。
+Day1～Day3 的契约、Client、Service 和 MCP 注册沿用已有实现。
+Day5 的三个重点函数：
+1. redact_sensitive_data：复制并脱敏 JSON 中的敏感字段。
+2. prepare_tool_result：将 MCP 业务结果精简到字符预算内。
+3. request_json_with_retry：对只读 HTTP 查询执行有上限的重试。
+
+三个函数已接入 MCP 出站与 HTTP 查询路径，使用本地 Mock 做离线验收。
+学习内容、函数契约与各项验收见 docs/week6_day5.md。
 
 分层仍保留为类和函数，不拆分文件：MCP → Service → Client → Mock HTTP。
 所有数据和 Token 都是本地合成值，不访问公司系统，不调用 LLM。
@@ -13,10 +15,11 @@
 """
 
 import copy
+import json
 import re
 from collections.abc import Callable
 from curses.ascii import isdigit
-from typing import Literal, Annotated
+from typing import Literal, Annotated, Any
 from urllib.parse import quote
 
 import httpx
@@ -27,6 +30,12 @@ from pydantic import BaseModel, ConfigDict, Field
 MOCK_TIME = "2026-10-28T00:00:00Z"
 MAX_LIMIT = 100
 SOURCE = "mock_task_api"
+MAX_TOOL_RESULT_CHARS = 6000
+SENSITIVE_FIELDS = {
+    "authorization", "token", "access_token", "refresh_token",
+    "api_key", "password", "secret", "client_secret",
+}
+TASK_PUBLIC_FIELDS = {"task_id", "state", "engineCode", "params", "tags"}
 
 API_CONTRACTS = {
     "query_task": {
@@ -93,6 +102,170 @@ class BusinessResult(BaseModel):
     truncated: bool = False
     error_code: str | None = None
     next_cursor: str | None = None
+
+
+def redact_sensitive_data(value: Any) -> Any:
+    """复制并递归脱敏一个 JSON 值，不修改输入。
+
+    输入：JSON 可表示的 dict/list/str/int/float/bool/None。
+    输出：同样的数据结构；字典键忽略大小写后若属于 SENSITIVE_FIELDS，
+    对应值整体替换成 '[REDACTED]'；其他字典值、列表元素继续递归处理。
+    普通标量原样返回。不扫描任意正文推测秘密，不截断或改写业务标识符。
+    """
+    if isinstance(value, dict):
+        # 重新构造字典，避免修改输入；JSON 对象的键都是字符串。
+        result = {}
+        for key, item in value.items():
+            if key.lower() in SENSITIVE_FIELDS:
+                # 敏感字段的整个值都隐藏，即使该值本身是字典或列表。
+                result[key] = "[REDACTED]"
+            else:
+                result[key] = redact_sensitive_data(item)
+        return result
+
+    if isinstance(value, list):
+        # 列表中也可能嵌套字典或列表，逐项递归并保持原顺序。
+        result = []
+        for item in value:
+            result.append(redact_sensitive_data(item))
+        return result
+
+    # JSON 标量不可变，可直接返回；字符串即使像 JSON，也不额外解析。
+    return value
+
+
+def prepare_tool_result(
+    result: BusinessResult, max_chars: int = MAX_TOOL_RESULT_CHARS,
+) -> BusinessResult:
+    """在 MCP 返回前，复制、脱敏、精简并限长业务结果。
+
+    核心逻辑：先筛选公开字段，再删除大字段，最后从列表末尾移除记录。
+    每个阶段都重新测量处理后的完整结果，满足预算就立即返回。
+
+    输入：合法 BusinessResult；max_chars 为至少 512 的真正 int，不接受 bool。
+    输出：新的 BusinessResult，原输入不变。预算包含整个外层响应，计算方式为
+    len(json.dumps(result.model_dump(), ensure_ascii=True))，与 SDK 的结构化
+    工具输出序列化方式一致；这是字符预算，不是 Token 数。
+
+    处理规则：
+    - 调用 redact_sensitive_data。任务顶层只保留 TASK_PUBLIC_FIELDS；列表
+      data 只保留 items/total。去掉其他业务字段也算截断。
+    - 先保留完整公开字段；超预算时删除任务的 params/tags，再从列表末尾
+      移除记录直到满足预算，保持剩余记录顺序。total 保留原匹配总数。
+    - 有字段或记录被删时设置 truncated=True；success/partial 改为 partial。
+      已经 partial 的结果不能恢复为 success，也不能把截断列表标成 empty。
+    - source/fetched_at/error_code/next_cursor 保留；本练习 next_cursor=None。
+      无数据的 empty/error/needs_input 保持原有状态。
+    - 不截断 task_id/state/engineCode 等标识值；详情的最小字段仍放不下时，
+      返回 error/RESULT_TOO_LARGE、data=None、truncated=True，并保留来源与时刻。
+      若连基础元数据都超过预算，抛 ValueError，不返回超预算响应。
+    """
+    if type(max_chars) is not int or max_chars < 512:
+        raise ValueError("max_chars 必须是至少 512 的整数")
+    prepared = result.model_copy(deep=True)
+    prepared.data = redact_sensitive_data(prepared.data)
+
+    def within_budget() -> bool:
+        # 始终测量 prepared，并包含来源、状态等外层字段；不能只测量 data。
+        return len(json.dumps(prepared.model_dump(), ensure_ascii=True)) <= max_chars
+
+    def mark_truncated():
+        prepared.truncated = True
+        # 错误和缺参不会因为裁剪就变成成功查询的部分结果。
+        if prepared.status in ("success", "partial"):
+            prepared.status = "partial"
+
+    # 错误或空详情可能没有 data；保留其原有状态和错误代码。
+    if prepared.data is None:
+        if not within_budget():
+            raise ValueError("基础元数据超过字符预算")
+        return prepared
+
+    # 列表外层保留 items/total，任务字段白名单应用到每一条记录上。
+    is_list = "items" in prepared.data
+    if is_list:
+        for key in list(prepared.data):
+            if key not in {"items", "total"}:
+                del prepared.data[key]
+                mark_truncated()
+        tasks = prepared.data["items"]
+    else:
+        tasks = [prepared.data]
+
+    # 第一阶段：删除内部字段。遍历键的副本，避免边遍历字典边删除键。
+    for task in tasks:
+        for key in list(task):
+            if key not in TASK_PUBLIC_FIELDS:
+                del task[key]
+                mark_truncated()
+    if within_budget():
+        return prepared
+
+    # 第二阶段：优先去掉参数和备注，保留 ID、状态、流程编码及记录数量。
+    for task in tasks:
+        for key in ("params", "tags"):
+            if key in task:
+                del task[key]
+                mark_truncated()
+    if within_budget():
+        return prepared
+
+    # 第三阶段：只从列表末尾删除，每次重新测量，保留原顺序的前缀。
+    # 即使所有记录都被裁掉，total 也不变，仍表示 partial 而不是 empty。
+    if is_list:
+        while prepared.data["items"] and not within_budget():
+            prepared.data["items"].pop()
+            mark_truncated()
+        if within_budget():
+            return prepared
+
+    # 不截断业务 ID 或来源来凑预算；无法表示详情时明确返回限长错误。
+    prepared.status = "error"
+    prepared.error_code = "RESULT_TOO_LARGE"
+    prepared.data = None
+    prepared.truncated = True
+    if not within_budget():
+        raise ValueError("基础元数据超过字符预算")
+
+    return prepared
+
+
+def request_json_with_retry(
+    client: httpx.Client, path: str, *, params: dict | None = None,
+    max_attempts: int = 1,
+) -> dict:
+    """通过有限循环重试只读 GET，成功后返回解析后的 JSON。
+
+    核心逻辑：每轮重新发送请求；成功立即返回；遇到不可重试错误，或最后
+    一次尝试仍失败时，立即抛出原异常并结束循环。
+
+    path 是固定接口路径，params 是查询参数；身份仍由 Client 请求头管理。
+    max_attempts 是含首次请求在内的总尝试次数，允许 1～3 的真正 int。
+    仅重试 TimeoutException、ConnectError、HTTP 429 / 5xx；403/404/其他
+    4xx、其他请求异常和 JSON 解析失败立即抛出。达到上限后继续抛原异常，
+    由 Service 映射成业务 error。每次重试都必须重新执行 client.get。
+    本地学习不做 sleep，不实现后台重试；成功或空数据正常返回。
+    """
+    if type(max_attempts) is not int or not 1 <= max_attempts <= 3:
+        raise ValueError("max_attempts 必须是 1～3 的整数")
+    # attempt 包括首次请求，例如 max_attempts=2 表示最多发送两次 GET。
+    for attempt in range(1, max_attempts + 1):
+        try:
+            result = client.get(path, params=params)
+            # 先检查 HTTP 状态，避免将 403/404 的响应正文当成查询成功。
+            result.raise_for_status()
+        except (httpx.TimeoutException, httpx.ConnectError):
+            # 临时网络故障可以进入下一轮；最后一次失败则保留原异常类型和对象。
+            if attempt == max_attempts:
+                raise
+        except httpx.HTTPStatusError as error:
+            status = error.response.status_code
+            retryable = status == 429 or 500 <= status < 600
+            if not retryable or attempt == max_attempts:
+                raise
+        else:
+            # HTTP 成功后只解析一次；空数据正常返回，JSON 解析失败也不重试。
+            return result.json()
 
 
 def response(status: str, data=None, error_code=None, *, truncated=False) -> dict:
@@ -192,23 +365,26 @@ class BusinessAPIClient:
     """Day2：只负责 HTTP 请求与 JSON 解析，空结果正常返回。
 
     注入的 httpx.Client 由调用方管理生命周期。HTTP 错误继续抛出，交给
-    Day3 Service 统一转换；本层不重试，测试也不会请求任何公司地址。
+    Day3 Service 统一转换；默认单次请求，Day5 可配置最多 3 次尝试。
     """
 
-    def __init__(self, client: httpx.Client):
+    def __init__(self, client: httpx.Client, *, max_attempts: int = 1):
         self.client = client
+        self.max_attempts = max_attempts
 
     def query_task(self, task_id: str) -> dict:
         """GET /tasks/{task_id}，返回包含 status/data 等字段的原始字典。"""
-        result = self.client.get(f"/tasks/{quote(str(task_id), safe='')}")
-        result.raise_for_status()
-        return result.json()
+        return request_json_with_retry(
+            self.client, f"/tasks/{quote(str(task_id), safe='')}",
+            max_attempts=self.max_attempts,
+        )
 
     def query_tasks_by_engine(self, engine_code: str, limit: int = MAX_LIMIT) -> dict:
         """按 engineCode 精确查询列表；limit 默认 100，合法范围为 1～100。"""
-        result = self.client.get("/tasks", params={"engine_code": engine_code, "limit": limit})
-        result.raise_for_status()
-        return result.json()
+        return request_json_with_retry(
+            self.client, "/tasks", params={"engine_code": engine_code, "limit": limit},
+            max_attempts=self.max_attempts,
+        )
 
 
 def map_api_error(error: httpx.HTTPError | ValueError) -> BusinessResult:
@@ -337,7 +513,7 @@ def create_mcp_server(service: BusinessService) -> MCPServer:
         """
         通过任务ID查询相应的任务信息
         """
-        return service.query_task(task_id)
+        return prepare_tool_result(service.query_task(task_id))
 
 
     @mcp.tool()
@@ -347,7 +523,7 @@ def create_mcp_server(service: BusinessService) -> MCPServer:
         """
         根据 engine code 和 limit 的组合查询指定个数指定类型的任务信息
         """
-        return service.query_tasks_by_engine(engine_code, limit)
+        return prepare_tool_result(service.query_tasks_by_engine(engine_code, limit))
 
     return mcp
 
@@ -355,5 +531,5 @@ def create_mcp_server(service: BusinessService) -> MCPServer:
 if __name__ == "__main__":
     # 完成 Day3 后：.venv/bin/python -B week6.py；该命令启动离线 stdio 服务。
     with create_mock_http_client() as http_client:
-        service = BusinessService(BusinessAPIClient(http_client))
+        service = BusinessService(BusinessAPIClient(http_client, max_attempts=2))
         create_mcp_server(service).run(transport="stdio")

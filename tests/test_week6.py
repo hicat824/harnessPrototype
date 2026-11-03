@@ -1,4 +1,4 @@
-"""Week6 Day1～Day3 合并测试：实现只放在 week6.py，本文件只放测试。
+"""Week6 Day1～Day5 合并测试：实现只放在 week6.py，本文件只放测试。
 
 数据来源
 --------
@@ -29,12 +29,20 @@
 week6.py，真实完成 initialize → list_tools → call_tool → 关闭子进程。
 不接 Agents SDK / LLM；自然语言自主选工具留到 Day4。
 
+测试五：Day5 结果边界、权限与 HTTP 有限重试
+----------------------------------------
+数据来源：现有 TASKS，加上测试现场生成的大 JSON、合成密钥与故障响应。
+架构：结果准备函数 / Client → MockTransport / MCP → Service。
+检查：脱敏、完整响应预算、来源与总数、实际请求次数和服务端权限。
+每个测试的独立说明、三个函数的输入输出见 docs/week6_day5.md。
+
 运行（仓库根目录）
 ------------------
 已提供部分：.venv/bin/python -B -m pytest tests/test_week6.py -q
 完成四个 TODO 后：RUN_WEEK6_DAY3=1 .venv/bin/python -B -m pytest tests/test_week6.py -q
 只看 Day3：RUN_WEEK6_DAY3=1 .venv/bin/python -B -m pytest tests/test_week6.py -q -k day3
 Day3 默认 skip 表示尚未验收；显式启用后未完成函数必须失败，不能静默跳过。
+Day5：RUN_WEEK6_DAY5=1 .venv/bin/python -B -m pytest tests/test_week6.py -q -k day5
 """
 
 import copy
@@ -50,12 +58,19 @@ from week6 import (
     API_CONTRACTS, MAX_LIMIT, MOCK_TIME, MOCK_TOKENS, SOURCE, TASKS,
     BusinessAPIClient, BusinessResult, BusinessService,
     create_mcp_server, create_mock_http_client, map_api_error, mock_handler,
+    MAX_TOOL_RESULT_CHARS, prepare_tool_result, redact_sensitive_data,
+    request_json_with_retry, response, visible_task,
 )
 
 
 DAY3 = pytest.mark.skipif(
     os.environ.get("RUN_WEEK6_DAY3") != "1",
     reason="Day3 练习待实现，完成后设置 RUN_WEEK6_DAY3=1 验收",
+)
+
+DAY5 = pytest.mark.skipif(
+    os.environ.get("RUN_WEEK6_DAY5") != "1",
+    reason="Day5 验收需显式设置 RUN_WEEK6_DAY5=1",
 )
 
 # 人工标注工具和参数；不是已经接入 LLM 的证明。
@@ -367,3 +382,332 @@ async def test_day3_mcp_stdio_lifecycle():
 
     # 包括启动与关闭在内的总时间边界，防止练习服务挂起后 pytest 无限等待。
     await asyncio.wait_for(check(), timeout=20)
+
+
+# Day5：测试数据均为本文件生成的合成值；各测试来源、目标及函数契约见
+# docs/week6_day5.md。这里不调用 LLM，也不会访问真实业务系统。
+def _day5_chars(result):
+    """仅测量整个结果的 JSON 字符数，不实现被测的裁剪规则。"""
+    return len(json.dumps(result.model_dump(), ensure_ascii=True))
+
+
+def _day5_large_task(task_id="12345"):
+    """人为放大公开任务字段，模拟大 JSON；不修改全局 TASKS。"""
+    return {
+        "task_id": task_id, "state": "RUNNING", "engineCode": "import_std",
+        "params": {"source": "mock/a.pcd", "large_text": "测试数据" * 6000},
+        "tags": {"note": "合成备注" * 6000},
+    }
+
+
+@DAY5
+def test_day5_redact_sensitive_fields_without_changing_input():
+    value = {
+        "task_id": "12345", "params": {
+            "API_KEY": "synthetic-key", "nested": [{"Password": "synthetic-password"}],
+            "source": "mock/a.pcd", "authorization": "Bearer synthetic-token",
+        },
+        "tags": {"token": "synthetic-token", "enabled": True, "missing": None},
+    }
+    before = copy.deepcopy(value)
+    result = redact_sensitive_data(value)
+    assert result["task_id"] == "12345"
+    assert result["params"]["API_KEY"] == "[REDACTED]"
+    assert result["params"]["nested"][0]["Password"] == "[REDACTED]"
+    assert result["params"]["authorization"] == "[REDACTED]"
+    assert result["params"]["source"] == "mock/a.pcd"
+    assert result["tags"] == {"token": "[REDACTED]", "enabled": True, "missing": None}
+    assert value == before
+    result["params"]["source"] = "changed"
+    assert value == before, "返回值不能共享原输入的嵌套字典"
+
+
+@DAY5
+def test_day5_short_result_preserves_business_data():
+    original = BusinessResult(status="success", data=visible_task(TASKS["12345"]))
+    result = prepare_tool_result(original)
+    assert result == original
+    assert result is not original
+    result.data["params"]["source"] = "changed"
+    assert original.data["params"]["source"] == "mock/a.pcd"
+
+
+@DAY5
+def test_day5_unknown_task_fields_are_removed_and_redacted():
+    task = visible_task(TASKS["12345"])
+    task.update(owner="alice", internal_debug="private synthetic detail")
+    task["params"]["api_key"] = "DAY5-SYNTHETIC-KEY"
+    original = BusinessResult(status="success", data=task)
+    before = original.model_dump()
+    result = prepare_tool_result(original)
+    assert "owner" not in result.data and "internal_debug" not in result.data
+    assert result.data["params"]["api_key"] == "[REDACTED]"
+    assert "DAY5-SYNTHETIC-KEY" not in result.model_dump_json()
+    assert result.status == "partial" and result.truncated is True
+    assert result.source == SOURCE and result.fetched_at == MOCK_TIME
+    assert original.model_dump() == before
+
+
+@DAY5
+def test_day5_large_detail_has_budget_and_original_reference():
+    original = BusinessResult(status="success", data=_day5_large_task())
+    before = original.model_dump()
+    result = prepare_tool_result(original, max_chars=1024)
+    assert _day5_chars(result) <= 1024
+    assert result.status == "partial" and result.truncated is True
+    assert result.source == SOURCE and result.fetched_at == MOCK_TIME
+    assert result.data["task_id"] == "12345"
+    assert result.data["state"] == "RUNNING"
+    assert result.data["engineCode"] == "import_std"
+    assert original.model_dump() == before
+
+
+@DAY5
+def test_day5_large_list_keeps_prefix_total_and_truncation():
+    items = [_day5_large_task(str(30000 + number)) for number in range(30)]
+    original = BusinessResult(status="success", data={"items": items, "total": 30})
+    before = original.model_dump()
+    result = prepare_tool_result(original, max_chars=1024)
+    selected = result.data["items"]
+    assert _day5_chars(result) <= 1024
+    assert 0 < len(selected) < len(items)
+    assert [item["task_id"] for item in selected] == [item["task_id"] for item in items[:len(selected)]]
+    assert result.data["total"] == 30
+    assert result.status == "partial" and result.truncated is True
+    assert result.next_cursor is None  # 本日使用 limit / 前缀截断，不虚构翻页能力。
+    assert original.model_dump() == before
+
+
+@DAY5
+def test_day5_no_record_fits_is_partial_instead_of_empty():
+    original = BusinessResult(
+        status="success", data={"items": [_day5_large_task("7" * 3000)], "total": 1},
+    )
+    result = prepare_tool_result(original, max_chars=512)
+    assert _day5_chars(result) <= 512
+    assert result.data == {"items": [], "total": 1}
+    assert result.status == "partial" and result.truncated is True
+
+
+@DAY5
+def test_day5_identifier_cannot_be_cut_to_fit():
+    original = BusinessResult(status="success", data=_day5_large_task("7" * 3000))
+    result = prepare_tool_result(original, max_chars=512)
+    assert (result.status, result.error_code) == ("error", "RESULT_TOO_LARGE")
+    assert result.data is None and result.truncated is True
+    assert result.source == SOURCE and result.fetched_at == MOCK_TIME
+    assert _day5_chars(result) <= 512
+    assert original.data["task_id"] == "7" * 3000
+
+
+@DAY5
+def test_day5_metadata_itself_cannot_fit():
+    original = BusinessResult(status="success", source="synthetic-source/" * 1000, data=_day5_large_task())
+    with pytest.raises(ValueError):
+        prepare_tool_result(original, max_chars=512)
+
+
+@DAY5
+@pytest.mark.parametrize("max_chars", [0, 100, True, "1024"])
+def test_day5_invalid_budget_is_rejected(max_chars):
+    with pytest.raises(ValueError):
+        prepare_tool_result(BusinessResult(status="empty"), max_chars=max_chars)
+
+
+@DAY5
+@pytest.mark.parametrize("original", [
+    BusinessResult(status="empty", data={"items": [], "total": 0}),
+    BusinessResult(status="error", error_code="FORBIDDEN"),
+    BusinessResult(status="needs_input", error_code="MISSING_PARAMETER"),
+    BusinessResult(status="partial", data={"items": [visible_task(TASKS["12345"])], "total": 12}, truncated=True),
+])
+def test_day5_existing_result_states_and_metadata_are_preserved(original):
+    assert prepare_tool_result(original) == original
+
+
+@DAY5
+@pytest.mark.parametrize("failure", ["timeout", "connect", 429, 503])
+def test_day5_transient_failure_really_sends_a_second_request(failure):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if len(requests) == 1:
+            if failure == "timeout":
+                raise httpx.ReadTimeout("synthetic timeout", request=request)
+            if failure == "connect":
+                raise httpx.ConnectError("synthetic connection failure", request=request)
+            return httpx.Response(failure, json=response("error", error_code="UPSTREAM_HTTP_ERROR"))
+        return httpx.Response(200, json=response("success", data=visible_task(TASKS["12345"])))
+
+    with httpx.Client(base_url="https://mock.example", transport=httpx.MockTransport(handler), trust_env=False) as client:
+        result = BusinessAPIClient(client, max_attempts=2).query_task("12345")
+    assert result["status"] == "success" and result["data"]["task_id"] == "12345"
+    assert len(requests) == 2
+    assert requests[0].url == requests[1].url
+    assert all(request.method == "GET" for request in requests)
+
+
+@DAY5
+@pytest.mark.parametrize("max_attempts", [1, 2, 3])
+@pytest.mark.parametrize("failure,code", [
+    ("timeout", "TIMEOUT"), ("connect", "CONNECTION_ERROR"), (429, "UPSTREAM_HTTP_ERROR"), (503, "UPSTREAM_HTTP_ERROR"),
+])
+def test_day5_attempt_limit_and_final_service_error(failure, code, max_attempts):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        if failure == "timeout":
+            raise httpx.ReadTimeout("synthetic timeout", request=request)
+        if failure == "connect":
+            raise httpx.ConnectError("synthetic connection failure", request=request)
+        return httpx.Response(failure, json=response("error", error_code="UPSTREAM_HTTP_ERROR"))
+
+    with httpx.Client(base_url="https://mock.example", transport=httpx.MockTransport(handler), trust_env=False) as client:
+        result = BusinessService(BusinessAPIClient(client, max_attempts=max_attempts)).query_task("12345")
+    assert (result.status, result.error_code) == ("error", code)
+    assert result.data is None
+    assert len(requests) == max_attempts, "max_attempts 是总尝试次数，不是额外重试次数"
+
+
+@DAY5
+@pytest.mark.parametrize("status,code", [(400, "UPSTREAM_HTTP_ERROR"), (403, "FORBIDDEN"), (404, "NOT_FOUND"), (422, "UPSTREAM_HTTP_ERROR")])
+def test_day5_non_retryable_http_failure_only_once(status, code):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(status, json=response("error", error_code=code))
+
+    with httpx.Client(base_url="https://mock.example", transport=httpx.MockTransport(handler), trust_env=False) as client:
+        result = BusinessService(BusinessAPIClient(client, max_attempts=3)).query_task("12345")
+    assert (result.status, result.error_code) == ("error", code)
+    assert len(requests) == 1
+
+
+@DAY5
+def test_day5_invalid_json_does_not_retry_or_expose_body():
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, text="not-json DAY5-SYNTHETIC-SECRET")
+
+    with httpx.Client(base_url="https://mock.example", transport=httpx.MockTransport(handler), trust_env=False) as client:
+        result = BusinessService(BusinessAPIClient(client, max_attempts=3)).query_task("12345")
+    assert (result.status, result.error_code) == ("error", "INVALID_RESPONSE")
+    assert len(requests) == 1
+    assert "DAY5-SYNTHETIC-SECRET" not in result.model_dump_json()
+
+
+@DAY5
+@pytest.mark.parametrize("max_attempts", [0, 4, True, "2"])
+def test_day5_invalid_attempt_limit_sends_no_request(max_attempts):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json=response("empty"))
+
+    with httpx.Client(base_url="https://mock.example", transport=httpx.MockTransport(handler), trust_env=False) as client:
+        with pytest.raises(ValueError):
+            request_json_with_retry(client, "/tasks/12345", max_attempts=max_attempts)
+    assert requests == []
+
+
+@DAY5
+@pytest.mark.parametrize("method,params", [
+    ("query_task", {"task_id": "12345"}),
+    ("query_tasks_by_engine", {"engine_code": "import_std", "limit": 3}),
+])
+def test_day5_empty_result_is_not_retried(method, params):
+    requests = []
+    payload = response("empty", data=None if method == "query_task" else {"items": [], "total": 0})
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json=payload)
+
+    with httpx.Client(base_url="https://mock.example", transport=httpx.MockTransport(handler), trust_env=False) as client:
+        result = getattr(BusinessService(BusinessAPIClient(client, max_attempts=3)), method)(**params)
+    assert result.status == "empty" and result.error_code is None
+    assert len(requests) == 1
+
+
+@DAY5
+@pytest.mark.parametrize("method,params", [
+    ("query_task", {"task_id": "12345"}),
+    ("query_tasks_by_engine", {"engine_code": "import_std", "limit": 3}),
+])
+@pytest.mark.asyncio
+async def test_day5_mcp_boundary_uses_prepared_result(api_client, monkeypatch, method, params):
+    # 任务含长字段和合成密钥，通过实际注册的 MCP 工具验收出站边界。
+    service = BusinessService(api_client)
+    task = _day5_large_task()
+    task["params"]["api_key"] = "DAY5-SYNTHETIC-KEY"
+    payload = task if method == "query_task" else {"items": [task], "total": 1}
+    monkeypatch.setattr(api_client, method, lambda *args: response("success", data=payload))
+    server = create_mcp_server(service)
+    raw = await server.call_tool(method, params)
+    result = BusinessResult.model_validate(raw.structured_content)
+    assert _day5_chars(result) <= MAX_TOOL_RESULT_CHARS
+    assert result.status == "partial" and result.truncated is True
+    returned_task = result.data if method == "query_task" else result.data["items"][0]
+    assert returned_task["task_id"] == "12345"
+    assert "DAY5-SYNTHETIC-KEY" not in result.model_dump_json()
+
+
+@DAY5
+@pytest.mark.asyncio
+async def test_day5_server_permissions_are_enforced(api_client, monkeypatch):
+    # 工具仍然可见，但服务端权限关闭时不允许执行 API。
+    service = BusinessService(api_client, can_read_tasks=False)
+    calls = []
+    monkeypatch.setattr(api_client, "query_task", lambda *args: calls.append(args))
+    server = create_mcp_server(service)
+    assert {tool.name for tool in await server.list_tools()} == {"query_task", "query_tasks_by_engine"}
+    raw = await server.call_tool("query_task", {"task_id": "12345"})
+    result = BusinessResult.model_validate(raw.structured_content)
+    assert (result.status, result.error_code) == ("error", "FORBIDDEN")
+    assert result.data is None and calls == []
+
+
+@DAY5
+@pytest.mark.asyncio
+async def test_day5_upstream_owner_permission_is_not_bypassed(api_client):
+    server = create_mcp_server(BusinessService(api_client))
+    raw = await server.call_tool("query_task", {"task_id": "34567"})
+    result = BusinessResult.model_validate(raw.structured_content)
+    assert (result.status, result.error_code) == ("error", "FORBIDDEN")
+    assert result.data is None
+
+
+@DAY5
+def test_day5_other_protocol_error_is_not_retried():
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        raise httpx.RemoteProtocolError("synthetic protocol failure", request=request)
+
+    with httpx.Client(base_url="https://mock.example", transport=httpx.MockTransport(handler), trust_env=False) as client:
+        with pytest.raises(httpx.RemoteProtocolError):
+            BusinessAPIClient(client, max_attempts=3).query_task("12345")
+    assert len(requests) == 1
+
+
+@DAY5
+def test_day5_exhausted_retry_preserves_original_exception():
+    requests = []
+    error = httpx.ConnectError("synthetic connection failure")
+
+    def handler(request):
+        requests.append(request)
+        raise error
+
+    with httpx.Client(base_url="https://mock.example", transport=httpx.MockTransport(handler), trust_env=False) as client:
+        with pytest.raises(httpx.ConnectError) as captured:
+            request_json_with_retry(client, "/tasks/12345", max_attempts=2)
+    assert captured.value is error
+    assert len(requests) == 2

@@ -50,6 +50,8 @@ class fakeAgentLite:
             },
             name="week6_business",
             client_session_timeout_seconds=10,
+            # HTTP 只读重试由服务端 Client 负责，MCP 层不叠加自动重试。
+            max_retry_attempts=0,
             # 本服务返回 BusinessResult，模型直接使用其结构化 JSON。
             use_structured_content=True,
         )
@@ -72,6 +74,7 @@ class fakeAgentLite:
 
         MCP 执行失败或缺少结构化响应时抛异常；业务查询的 error/empty/partial
         仍作为正常 BusinessResult 返回，不与 MCP 协议错误混淆。
+        MCP 断连保留 SDK 异常向上抛出，不伪装成业务 empty/error，不自动重连。
         """
         if tool_name not in await self.showMcpTools():
             raise ValueError(f"unknown tool: {tool_name}")

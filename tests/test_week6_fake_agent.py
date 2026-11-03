@@ -1,4 +1,4 @@
-"""Week6 Day4：MCPServerStdio 与单个业务 Agent 的联调验收。
+"""Week6 Day4～Day5：MCPServerStdio 与单个业务 Agent 的联调验收。
 
 测试一：工具发现和生命周期（离线）
 --------------------------------
@@ -27,11 +27,18 @@ Mock Runner 只验证包装逻辑，不证明真实 LLM 会自主选择工具。
 每个用例将问题、工具调用、结果、回答、usage 保存到 pytest 的 tmp_path，
 并打印文件路径。关键项检查是初筛，回答是否清晰仍可人工阅读。
 
+Day5 测试：断连、重试配置、stdio 日志边界（离线）
+----------------------------------------------
+数据来源：模拟的 SDK 断连异常、SDK 构造参数及注入合成密钥的临时服务。
+检查：断连保留异常、MCP 不叠加重试、真实子进程 stdout 只有协议且不泄漏秘密。
+逐测试说明及三个业务函数的契约见 docs/week6_day5.md。
+
 运行（仓库根目录）
 ------------------
 离线：.venv/bin/python -B -m pytest tests/test_week6_fake_agent.py -q
 真实：RUN_WEEK6_DAY4_LLM=1 .venv/bin/python -B -m pytest tests/test_week6_fake_agent.py -q -s -k LLM
 真实测试还需要可用的 OPENAI_API_KEY（沿用 DeepSeek 配置）；显式启用但缺少 Key 时失败。
+Day5：RUN_WEEK6_DAY5=1 .venv/bin/python -B -m pytest tests/test_week6_fake_agent.py -q -s -k day5
 """
 
 import asyncio
@@ -46,6 +53,12 @@ from agents.items import ToolCallItem, ToolCallOutputItem
 import week6_fake_agent
 from week6_fake_agent import fakeAgentLite
 from week6 import BusinessResult, MOCK_TOKENS, SOURCE
+
+
+DAY5 = pytest.mark.skipif(
+    os.environ.get("RUN_WEEK6_DAY5") != "1",
+    reason="Day5 验收需设置 RUN_WEEK6_DAY5=1；说明见 docs/week6_day5.md",
+)
 
 
 @pytest.mark.asyncio
@@ -303,3 +316,133 @@ async def test_query_task_by_LLM(tmp_path, prompt, tool_name, arguments, facts):
         finally:
             path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             print(f"Day4 真实查询验收产物：{path}")
+
+
+@DAY5
+@pytest.mark.asyncio
+async def test_day5_disconnect_stays_an_exception():
+    """模拟 SDK 报告连接关闭；验证包装层不返回 empty，也不重试/重连。"""
+    from mcp.shared.exceptions import MCPError
+
+    error = MCPError(code=-32000, message="Connection closed")
+    server = SimpleNamespace(
+        list_tools=AsyncMock(return_value=[SimpleNamespace(name="query_task")]),
+        call_tool=AsyncMock(side_effect=error), __aexit__=AsyncMock(),
+    )
+    agent_lite = fakeAgentLite()
+    agent_lite._mcp_server = server
+    try:
+        with pytest.raises(MCPError) as captured:
+            await agent_lite.callMcpTool("query_task", {"task_id": "12345"})
+        assert captured.value is error
+        server.call_tool.assert_awaited_once()
+    finally:
+        await agent_lite.close()
+
+
+@DAY5
+@pytest.mark.asyncio
+async def test_day5_mcp_does_not_add_another_retry_layer(monkeypatch):
+    """检查传给 SDK 的配置；HTTP 的有限重试只由服务端 Client 执行。"""
+    captured = {}
+    server = SimpleNamespace(__aenter__=AsyncMock(), __aexit__=AsyncMock())
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return server
+
+    monkeypatch.setattr(week6_fake_agent, "MCPServerStdio", create)
+    agent_lite = fakeAgentLite()
+    try:
+        await agent_lite.Init()
+        assert captured["max_retry_attempts"] == 0
+    finally:
+        await agent_lite.close()
+
+
+@DAY5
+@pytest.mark.asyncio
+async def test_day5_stdio_stdout_is_protocol_and_secrets_are_hidden(tmp_path):
+    """真实启动本地服务，逐行检查 stdout；详情数据里注入的密钥完全为合成值。
+
+    测试生成的临时启动脚本只为注入测试数据；用户无需实现协议收发代码。
+    stdout/stderr 证据写入 tmp_path/stdio_report.json，不请求模型或公司接口。
+    """
+    from pathlib import Path
+    import sys
+    from mcp_types import LATEST_PROTOCOL_VERSION
+
+    repo = Path(__file__).resolve().parents[1]
+    script = tmp_path / "stdio_probe.py"
+    script.write_text(
+        "import week6\n"
+        "week6.TASKS['12345']['params']['api_key'] = 'DAY5-STDIO-SECRET'\n"
+        "with week6.create_mock_http_client() as client:\n"
+        "    service = week6.BusinessService(week6.BusinessAPIClient(client, max_attempts=2))\n"
+        "    week6.create_mcp_server(service).run(transport='stdio')\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env.pop("OPENAI_API_KEY", None)
+    env["PYTHONPATH"] = str(repo)
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-B", str(script), cwd=str(repo), env=env,
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout_lines = []
+    stderr_text = ""
+
+    async def send(message):
+        process.stdin.write((json.dumps(message) + "\n").encode("utf-8"))
+        await process.stdin.drain()
+
+    async def receive(request_id):
+        for _ in range(20):
+            line = await asyncio.wait_for(process.stdout.readline(), timeout=10)
+            assert line, "MCP 服务在返回结果前退出"
+            text = line.decode("utf-8").strip()
+            stdout_lines.append(text)
+            message = json.loads(text)  # 普通 print / HTTP 日志混入 stdout 会在这里失败。
+            assert message.get("jsonrpc") == "2.0"
+            if message.get("id") == request_id:
+                assert "error" not in message, message
+                return message["result"]
+        raise AssertionError("未收到对应的 MCP 响应")
+
+    try:
+        await send({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": LATEST_PROTOCOL_VERSION, "capabilities": {},
+                       "clientInfo": {"name": "day5-offline-probe", "version": "1.0"}},
+        })
+        await receive(1)
+        await send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        await send({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                    "params": {"name": "query_task", "arguments": {"task_id": "12345"}}})
+        reply = await receive(2)
+    finally:
+        process.stdin.close()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+        remaining = (await process.stdout.read()).decode("utf-8")
+        stdout_lines.extend(line for line in remaining.splitlines() if line)
+        stderr_text = (await process.stderr.read()).decode("utf-8")
+        path = tmp_path / "stdio_report.json"
+        path.write_text(json.dumps({
+            "stdout_lines": stdout_lines, "stderr": stderr_text,
+            "returncode": process.returncode,
+        }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(f"Day5 stdio 验收产物：{path}")
+
+    assert process.returncode == 0
+    assert all(json.loads(line).get("jsonrpc") == "2.0" for line in stdout_lines)
+    business = BusinessResult.model_validate(reply["structuredContent"])
+    assert business.data["task_id"] == "12345"
+    assert business.data["params"]["api_key"] == "[REDACTED]"
+    combined = "\n".join(stdout_lines) + stderr_text
+    assert "DAY5-STDIO-SECRET" not in combined
+    assert all(token not in combined for token in MOCK_TOKENS.values())
