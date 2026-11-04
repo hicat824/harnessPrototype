@@ -520,8 +520,12 @@ def create_mcp_server(service: BusinessService) -> MCPServer:
     def query_tasks_by_engine(engine_code: str, limit: Annotated[
         int, Field(strict=True, ge=1, le=100)
     ] = MAX_LIMIT) -> BusinessResult:
-        """
-        根据 engine code 和 limit 的组合查询指定个数指定类型的任务信息
+        """按实际 engine_code 精确查询任务列表，最多返回 limit 条。
+
+        engine_code 是必填参数，只能使用用户或当前已确认上下文提供的实际值。
+        仅知道 limit 时不能调用本工具；缺少编码时应先询问用户，
+        不得使用占位符、示例值或编造值，也不得调用本工具探测或确认缺参。
+        limit 可省略，默认 100，范围 1～100；仅限制返回条数，不代替 engine_code。
         """
         return prepare_tool_result(service.query_tasks_by_engine(engine_code, limit))
 
