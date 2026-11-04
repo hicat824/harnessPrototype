@@ -1,9 +1,10 @@
-"""Week6 Day4～Day6：Agents SDK 连接本地业务 MCP Server。
+"""Week6 Day4～Day7：Agents SDK 连接本地业务 MCP Server。
 
 Init / showMcpTools / callMcpTool 只访问本地 Mock，不需要 API Key。
 callLLM 首次调用时才创建 DeepSeek 客户端，沿用现有 Responses 模型配置。
 调用方在同一异步任务内依次 await Init()，执行查询，最后在 finally 中 close()。
 Day6 的三个函数及验收方法见 docs/week6_day6.md。
+Day7 的整合入口与周验收说明见 docs/week6_day7.md。
 """
 
 import os
@@ -508,3 +509,103 @@ async def run_day6_query(agent: Agent, question: str, max_tool_calls: int = 2) -
         "elapsed_seconds": elapsed_seconds,
         "parameter_validation": context.parameter_validation,
     }
+
+
+async def run_day7_demo(
+    questions: list[str], model: Model, output_path: str | Path,
+    *, model_mode: Literal["scripted", "real_llm"],
+) -> dict:
+    """整合周项目入口，复用 Day6 查询，并保存本次演示报告。
+
+    输入：
+    - questions：非空 list，元素必须为非空、非纯空白字符串，原文不改写。
+    - model：调用方配置好的模型；离线使用 ScriptedModel，真实演示使用
+      既有 DeepSeek 模型。模型 HTTP 客户端仍由调用方负责关闭。
+    - output_path：JSON 报告文件路径；父目录不存在时创建。
+    - model_mode：只能为 scripted / real_llm，用于如实标记证据类型。
+    questions/model_mode 应在连接 MCP 前校验，非法时抛 ValueError。
+
+    处理步骤：
+    1. 创建一个 fakeAgentLite，在 try/finally 内 Init/close，异常时也清理。
+    2. showMcpTools 必须恰好发现 query_task、query_tasks_by_engine 两个工具，
+       否则抛 RuntimeError；不要额外注册 Function Tools 或再开 MCP 连接。
+    3. 用 build_day6_agent(model, lite._mcp_server) 构建一次业务 Agent。
+       按 questions 顺序调用 run_day6_query，同一 Agent 复用、每问上下文独立。
+       不注入测试答案，不重跑失败任务，不修改返回记录。
+    4. 未受控异常原样抛出；finally 中关闭 MCP。所有查询正常返回后再保存报告，
+       因此本函数发生未受控异常时，不保证有批次报告；诊断仍可使用 Day6 测试。
+
+    返回并保存同一个 JSON 字典（ensure_ascii=False、indent=2、UTF-8）：
+    - business_backend='httpx_mock'，transport='stdio'。
+    - model_mode：原模式；usage_kind：scripted→synthetic，否则 provider_reported。
+    - tools：发现的工具名列表；query_count：问题条数；results：原顺序查询记录。
+    - completed：所有记录的 runner_completed 都为 True。业务 error 可以正常
+      完成，受控护栏中止为 False；此字段不表示回答质量或验收通过。
+    - usage_total：逐条累加 requests/input_tokens/output_tokens/total_tokens。
+      使用实际 usage，不估算；参数准备阶段的用量已经包含在每条记录中。
+    - elapsed_seconds：用 perf_counter 测量，从 Init 前到 close 后的耗时，
+      包括 MCP 生命周期与查询，不包括报告写盘。
+
+    数据、模型及预期答案由测试分别提供，说明见 docs/week6_day7.md；
+    本函数不导入 tests，也不自行读取 API Key。
+    """
+    # 类型注解不会自动检查实参；先校验列表和元素，避免对整数调用 strip()。
+    # 字符串本身也能被迭代，因此必须明确拒绝用一条字符串代替问题列表。
+    if not isinstance(questions, list) or not questions:
+        raise ValueError("questions 必须是非空列表")
+    for question in questions:
+        if not isinstance(question, str) or not question.strip():
+            raise ValueError("每条问题必须是非空、非纯空白字符串")
+    if model_mode not in ("scripted", "real_llm"):
+        raise ValueError("model_mode 必须是 scripted 或 real_llm")
+
+    report_path = Path(output_path)
+    agent_lite = fakeAgentLite()
+    # 计时覆盖连接建立、工具发现、查询和连接关闭，不包括报告写盘。
+    started = time.perf_counter()
+    try:
+        await agent_lite.Init()
+        tool_list = await agent_lite.showMcpTools()
+        # 工具发现顺序不影响能力；同时检查数量，避免重复名称也被集合比较放过。
+        if len(tool_list) != 2 or set(tool_list) != {"query_task", "query_tasks_by_engine"}:
+            raise RuntimeError("MCP 必须恰好提供两个只读任务查询工具")
+        day7_agent = build_day6_agent(model, agent_lite._mcp_server)
+
+        results = []
+        is_completed = True
+        usage = {
+            "requests": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+        }
+        for question in questions:
+            # 业务 Agent 复用，Day6 函数会为每条问题创建独立上下文和用量记录。
+            result = await run_day6_query(day7_agent, question)
+            if result["runner_completed"] is not True:
+                is_completed = False
+            # 每条 usage 已包含参数准备阶段，直接相加，不额外估算请求或 Token。
+            usage = {k: usage[k] + result["usage"][k] for k in usage}
+            results.append(result)
+    finally:
+        # finally 只清理资源，不能 return，否则会压制初始化或查询时的原异常。
+        # Init 部分失败时也调用 close；现有 close 支持重复清理。
+        await agent_lite.close()
+
+    # 只有所有查询正常返回且连接关闭后才会到这里；未受控异常自然向上抛出。
+    elapsed_seconds = time.perf_counter() - started
+    report = {
+        "business_backend": "httpx_mock",
+        "transport": "stdio",
+        "model_mode": model_mode,
+        "usage_kind": "synthetic" if model_mode == "scripted" else "provider_reported",
+        "tools": tool_list,
+        "query_count": len(questions),
+        "results": results,
+        "completed": is_completed,
+        "usage_total": usage,
+        "elapsed_seconds": elapsed_seconds,
+    }
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return report

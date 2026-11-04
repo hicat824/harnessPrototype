@@ -1,4 +1,4 @@
-"""Week6 Day4～Day6：MCPServerStdio 与单个业务 Agent 的联调验收。
+"""Week6 Day4～Day7：MCPServerStdio 与业务 Agent 的联调验收。
 
 测试一：工具发现和生命周期（离线）
 --------------------------------
@@ -40,6 +40,12 @@ Day6 测试：自然语言查询与固定 Evals
 提供的两个自检默认运行；待填写函数的验收需 RUN_WEEK6_DAY6=1，
 真实模型另需 RUN_WEEK6_DAY6_LLM=1。逐测试说明见 docs/week6_day6.md。
 
+Day7 测试：周项目整合与验收
+--------------------------
+复用四个 Day6 场景，检查批量入口、实际 MCP 生命周期、报告保存和异常退出。
+设置 RUN_WEEK6_DAY7=1 启用；真实演示另需 RUN_WEEK6_DAY7_LLM=1。
+整合入口及逐测试说明见 docs/week6_day7.md。
+
 运行（仓库根目录）
 ------------------
 离线：.venv/bin/python -B -m pytest tests/test_week6_fake_agent.py -q
@@ -53,7 +59,7 @@ import json
 import os
 import traceback
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from agents.items import ToolCallItem, ToolCallOutputItem
@@ -72,6 +78,7 @@ from week6_fake_agent import (
     day6_tool_use_behavior,
     build_day6_agent, check_day6_tool_call, run_day6_query,
     validate_day6_query_parameters,
+    run_day7_demo,
 )
 
 
@@ -83,6 +90,11 @@ DAY5 = pytest.mark.skipif(
 DAY6 = pytest.mark.skipif(
     os.environ.get("RUN_WEEK6_DAY6") != "1",
     reason="Day6 验收需设置 RUN_WEEK6_DAY6=1，说明见 docs/week6_day6.md",
+)
+
+DAY7 = pytest.mark.skipif(
+    os.environ.get("RUN_WEEK6_DAY7") != "1",
+    reason="Day7 验收需设置 RUN_WEEK6_DAY7=1，说明见 docs/week6_day7.md",
 )
 
 
@@ -1194,3 +1206,188 @@ async def test_day6_real_llm_evals(monkeypatch, tmp_path):
         assert report["passed"], [row["case_id"] for row in rows if not row["passed"]]
     finally:
         await lite.close()
+
+
+# Day7 只整合已有功能：成功详情、部分列表、缺参、权限失败。
+# 输入和预期沿用 Day6；应用入口只收到问题和模型，不会收到这些答案。
+DAY7_CASES = [DAY6_CASES[index] for index in (0, 1, 3, 4)]
+
+
+def _assert_day7_report(report, mode):
+    """测试侧验收周项目报告，不将 completed 当成质量通过的自评。"""
+    assert report["business_backend"] == "httpx_mock"
+    assert report["transport"] == "stdio"
+    assert report["model_mode"] == mode
+    assert report["usage_kind"] == ("synthetic" if mode == "scripted" else "provider_reported")
+    assert set(report["tools"]) == {"query_task", "query_tasks_by_engine"}
+    assert len(report["tools"]) == 2
+    assert report["query_count"] == len(DAY7_CASES)
+    assert len(report["results"]) == len(DAY7_CASES)
+    assert report["completed"] is True
+    assert type(report["elapsed_seconds"]) in (int, float) and report["elapsed_seconds"] >= 0
+    for row, case in zip(report["results"], DAY7_CASES):
+        checks = _grade_day6_case(row, case)
+        assert all(checks.values()), {"case_id": case["id"], "failed_checks": [
+            key for key, value in checks.items() if not value
+        ]}
+    for key in ("requests", "input_tokens", "output_tokens", "total_tokens"):
+        assert report["usage_total"][key] == sum(row["usage"][key] for row in report["results"])
+    assert all(token not in json.dumps(report) for token in MOCK_TOKENS.values())
+
+
+@DAY7
+@pytest.mark.usefixtures("day6_local_tracing")
+@pytest.mark.asyncio
+async def test_day7_full_mock_demo(monkeypatch, tmp_path):
+    """脚本模型、真实 MCP/Service/Mock API，验收整合入口和实际连接清理。"""
+    model = ScriptedModel(default_usage=Usage(requests=1, input_tokens=20, output_tokens=5, total_tokens=25))
+    for case in DAY7_CASES:
+        _day6_enqueue_case(model, case)
+    instances, servers = [], []
+
+    def create_lite():
+        lite = fakeAgentLite()
+        original_init = lite.Init
+
+        async def observed_init():
+            await original_init()
+            servers.append(lite._mcp_server)
+
+        lite.Init = AsyncMock(side_effect=observed_init)
+        lite.close = AsyncMock(wraps=lite.close)
+        instances.append(lite)
+        return lite
+
+    monkeypatch.setattr(week6_fake_agent, "fakeAgentLite", create_lite)
+    build = Mock(wraps=build_day6_agent)
+    monkeypatch.setattr(week6_fake_agent, "build_day6_agent", build)
+    path = tmp_path / "nested" / "day7_mock_demo.json"
+    report = await run_day7_demo(
+        [case["question"] for case in DAY7_CASES], model, path, model_mode="scripted",
+    )
+    _assert_day7_report(report, "scripted")
+    assert json.loads(path.read_text(encoding="utf-8")) == report
+    assert report["usage_total"]["requests"] == 9  # 3 + 3 + 1 + 2，包含参数准备。
+    assert len(instances) == 1 and len(servers) == 1
+    instances[0].Init.assert_awaited_once()
+    instances[0].close.assert_awaited_once()
+    assert servers[0].session is None
+    assert instances[0]._mcp_server is None
+    assert build.call_count == 1
+    model.assert_complete()
+    print(f"Day7 脚本模型整合产物：{path}")
+
+
+@pytest.fixture
+def day7_stub_dependencies(monkeypatch):
+    """仅给生命周期和错误分支用的替身；不作为 MCP 或模型联调证据。"""
+    lite = SimpleNamespace(
+        _mcp_server=object(), Init=AsyncMock(), close=AsyncMock(),
+        showMcpTools=AsyncMock(return_value=["query_task", "query_tasks_by_engine"]),
+    )
+    build = Mock(return_value=SimpleNamespace())
+    query = AsyncMock()
+    monkeypatch.setattr(week6_fake_agent, "fakeAgentLite", lambda: lite)
+    monkeypatch.setattr(week6_fake_agent, "build_day6_agent", build)
+    monkeypatch.setattr(week6_fake_agent, "run_day6_query", query)
+    return lite, build, query
+
+
+@DAY7
+@pytest.mark.parametrize("questions,mode", [
+    ([], "scripted"), ("查询任务 12345", "scripted"), (None, "scripted"),
+    ([""], "scripted"), (["  "], "scripted"), ([12345], "scripted"),
+    (["查询任务 12345"], "unknown"),
+])
+@pytest.mark.asyncio
+async def test_day7_invalid_input_before_connect(day7_stub_dependencies, tmp_path, questions, mode):
+    """非法批次或模式在连接前拒绝，避免无意义启动进程和模型请求。"""
+    lite, build, query = day7_stub_dependencies
+    with pytest.raises(ValueError):
+        await run_day7_demo(questions, ScriptedModel(), tmp_path / "invalid.json", model_mode=mode)
+    lite.Init.assert_not_awaited()
+    query.assert_not_awaited()
+    build.assert_not_called()
+    assert not (tmp_path / "invalid.json").exists()
+
+
+@DAY7
+@pytest.mark.parametrize("stage", ["init", "discovery", "query"])
+@pytest.mark.asyncio
+async def test_day7_unexpected_error_closes_mcp(day7_stub_dependencies, tmp_path, stage):
+    """替身模拟初始化/发现/查询失败，原异常抛出，finally 仍关闭连接。"""
+    lite, build, query = day7_stub_dependencies
+    error = RuntimeError(f"synthetic {stage} failure")
+    operation = {"init": lite.Init, "discovery": lite.showMcpTools, "query": query}[stage]
+    operation.side_effect = error
+    with pytest.raises(RuntimeError) as captured:
+        await run_day7_demo(["查询任务 12345"], ScriptedModel(), tmp_path / "failed.json", model_mode="scripted")
+    assert captured.value is error
+    lite.close.assert_awaited_once()
+    assert not (tmp_path / "failed.json").exists()
+    if stage != "query":
+        query.assert_not_awaited()
+        build.assert_not_called()
+
+
+@DAY7
+@pytest.mark.asyncio
+async def test_day7_unexpected_tool_scope_is_rejected(day7_stub_dependencies, tmp_path):
+    """发现额外能力时拒绝演示，不把扩大工具范围当成周项目验收通过。"""
+    lite, build, query = day7_stub_dependencies
+    lite.showMcpTools.return_value = ["query_task", "query_tasks_by_engine", "write_task"]
+    with pytest.raises(RuntimeError):
+        await run_day7_demo(["查询任务 12345"], ScriptedModel(), tmp_path / "scope.json", model_mode="scripted")
+    lite.close.assert_awaited_once()
+    build.assert_not_called()
+    query.assert_not_awaited()
+
+
+@DAY7
+@pytest.mark.asyncio
+async def test_day7_controlled_stop_is_not_claimed_completed(day7_stub_dependencies, tmp_path):
+    """护栏返回记录可以保存，但不能将受控中止宣称为整个演示正常完成。"""
+    lite, _, query = day7_stub_dependencies
+    row = {
+        "question": "查询任务 12345", "runner_completed": False,
+        "answer": week6_fake_agent.day6_failure_answer("TOOL_CALL_LIMIT").model_dump(),
+        "tool_calls": [], "tool_call_count": 0,
+        "blocked_calls": [{"name": "query_task", "error_code": "TOOL_CALL_LIMIT"}],
+        "blocked_call_count": 1,
+        "usage": {"requests": 2, "input_tokens": 40, "output_tokens": 10, "total_tokens": 50},
+        "elapsed_seconds": 0.1, "parameter_validation": None,
+    }
+    query.return_value = row
+    path = tmp_path / "controlled_stop.json"
+    report = await run_day7_demo([row["question"]], ScriptedModel(), path, model_mode="scripted")
+    assert report["completed"] is False
+    assert report["results"] == [row]
+    assert report["usage_total"] == row["usage"]
+    assert json.loads(path.read_text(encoding="utf-8")) == report
+    lite.close.assert_awaited_once()
+
+
+@DAY7
+@pytest.mark.usefixtures("day6_local_tracing")
+@pytest.mark.skipif(
+    os.environ.get("RUN_WEEK6_DAY7_LLM") != "1",
+    reason="Day7 真实整合演示需另行设置 RUN_WEEK6_DAY7_LLM=1",
+)
+@pytest.mark.asyncio
+async def test_day7_real_llm_demo(tmp_path):
+    """真实模型加本地 Mock API；调用同一个周项目入口，输出持久报告。"""
+    from openai import AsyncOpenAI
+    from agents import OpenAIResponsesModel
+
+    if os.environ.get("RUN_WEEK6_DAY7_LLM") != "1":
+        pytest.skip("请先显式启用 Day7 真实演示")
+    assert os.environ.get("OPENAI_API_KEY"), "缺少既有 DeepSeek OPENAI_API_KEY"
+    path = tmp_path / "day7_real_llm_demo.json"
+    print(f"Day7 真实模型整合产物：{path}")
+    async with AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"], base_url="https://api.deepseek.com", timeout=60.0) as client:
+        model = OpenAIResponsesModel(model="deepseek-flash", openai_client=client)
+        report = await asyncio.wait_for(run_day7_demo(
+            [case["question"] for case in DAY7_CASES], model, path, model_mode="real_llm",
+        ), timeout=480)
+    _assert_day7_report(report, "real_llm")
+    assert json.loads(path.read_text(encoding="utf-8")) == report
