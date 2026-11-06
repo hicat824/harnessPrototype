@@ -1,0 +1,157 @@
+{
+  "schema_version": 1,
+  "source": "Week7 合成知识集 manifest.json；reference_points 为评估参考，不进入模型输入",
+  "cases": [
+    {
+      "case_id": "W7D6-01",
+      "question": "NOT_FOUND 是不是表示任务执行失败？",
+      "filters": {"knowledge_status": "current"},
+      "expected_status": "answered",
+      "expected_doc_groups": [["KB012"]],
+      "allowed_versions": ["2.0"],
+      "allowed_knowledge_statuses": ["current"],
+      "reference_points": ["表示本次查询未找到指定任务", "不等于任务执行失败或无访问权限"]
+    },
+    {
+      "case_id": "W7D6-02",
+      "question": "请说明 import_std 3.0 版新增的验收步骤。",
+      "filters": {"engine_code": "import_std", "knowledge_status": "current", "version": "3.0"},
+      "expected_status": "insufficient",
+      "expected_doc_groups": [],
+      "allowed_versions": ["3.0"],
+      "allowed_knowledge_statuses": ["current"],
+      "reference_points": ["本知识集没有 3.0 版资料", "应说明证据不足，不能套用 2.0 版编造新增步骤"]
+    },
+    {
+      "case_id": "W7D6-03",
+      "question": "查询返回 FORBIDDEN，能否认为任务不存在或已经执行失败？",
+      "filters": {"knowledge_status": "current"},
+      "expected_status": "answered",
+      "expected_doc_groups": [["KB010", "KB011"]],
+      "allowed_versions": ["2.0"],
+      "allowed_knowledge_statuses": ["current"],
+      "reference_points": ["拒绝只说明没有获得访问权限", "不能据此推断存在性或执行状态"]
+    },
+    {
+      "case_id": "W7D6-04",
+      "question": "查询成功但返回 state=FAILED，查询本身算失败吗？",
+      "filters": {"knowledge_status": "current"},
+      "expected_status": "answered",
+      "expected_doc_groups": [["KB006"]],
+      "allowed_versions": ["2.0"],
+      "allowed_knowledge_statuses": ["current"],
+      "reference_points": ["查询成功与任务执行状态是两层状态", "成功读取了一个失败任务，不等于查询失败"]
+    },
+    {
+      "case_id": "W7D6-05",
+      "question": "task_id 带前导零时，可以先转成整数再转回字符串吗？",
+      "filters": {"knowledge_status": "current"},
+      "expected_status": "answered",
+      "expected_doc_groups": [["KB007"]],
+      "allowed_versions": ["2.0"],
+      "allowed_knowledge_statuses": ["current"],
+      "reference_points": ["task_id 是字符串", "前导零属于原值，不应通过整数转换丢失"]
+    },
+    {
+      "case_id": "W7D6-06",
+      "question": "2.0 版列表查询的 limit 默认值、范围和类型是什么？",
+      "filters": {"knowledge_status": "current", "version": "2.0"},
+      "expected_status": "answered",
+      "expected_doc_groups": [["KB008"]],
+      "allowed_versions": ["2.0"],
+      "allowed_knowledge_statuses": ["current"],
+      "reference_points": ["默认 100", "允许范围 1～100，必须是整数", "engine_code 必填"]
+    },
+    {
+      "case_id": "W7D6-07",
+      "question": "历史 1.0 版列表查询的 limit 默认值和上限是多少？",
+      "filters": {"knowledge_status": "historical", "version": "1.0"},
+      "expected_status": "answered",
+      "expected_doc_groups": [["KB009"]],
+      "allowed_versions": ["1.0"],
+      "allowed_knowledge_statuses": ["historical"],
+      "reference_points": ["默认 30、上限 30、最小 1", "明确说明这是历史规则，不是当前上限"]
+    },
+    {
+      "case_id": "W7D6-08",
+      "question": "import_std 2.0 版在标记交付前，需要人工复核吗？",
+      "k": 10,
+      "filters": {"engine_code": "import_std", "knowledge_status": "current", "version": "2.0"},
+      "expected_status": "answered",
+      "expected_doc_groups": [["KB002"]],
+      "allowed_versions": ["2.0"],
+      "allowed_knowledge_statuses": ["current"],
+      "reference_points": ["需要人工复核通过后再标记交付", "仍有关键校验失败不能称为验收完成"]
+    },
+    {
+      "case_id": "W7D6-09",
+      "question": "回溯 import_std 的 1.0 历史版，自动检查通过后是否允许登记交付？",
+      "filters": {"engine_code": "import_std", "knowledge_status": "historical", "version": "1.0"},
+      "expected_status": "answered",
+      "expected_doc_groups": [["KB003"]],
+      "allowed_versions": ["1.0"],
+      "allowed_knowledge_statuses": ["historical"],
+      "reference_points": ["历史版允许自动检查通过后登记交付", "没有 2.0 版人工复核步骤，不能作为当前规则"]
+    },
+    {
+      "case_id": "W7D6-10",
+      "question": "import_standard 的处理对象是什么，它是否承担 import_std 的原始格式转换？",
+      "filters": {"engine_code": "import_standard", "knowledge_status": "current"},
+      "expected_status": "answered",
+      "expected_doc_groups": [["KB004"]],
+      "allowed_versions": ["2.0"],
+      "allowed_knowledge_statuses": ["current"],
+      "reference_points": ["接收已符合标准结构的输入包，检查结构一致性", "不承担 import_std 的原始格式转换"]
+    },
+    {
+      "case_id": "W7D6-11",
+      "question": "列表只返回 items=3 条，为什么 total 可以是 12？应如何说明？",
+      "filters": {"knowledge_status": "current"},
+      "expected_status": "answered",
+      "expected_doc_groups": [["KB008", "KB014"]],
+      "allowed_versions": ["2.0"],
+      "allowed_knowledge_statuses": ["current"],
+      "reference_points": ["items 是本次返回条数，total 是匹配总数", "属于部分结果，不能把 total 改成 3"]
+    },
+    {
+      "case_id": "W7D6-12",
+      "question": "truncated=true 或只看到前几行预览时，能推断全文件统计吗？",
+      "filters": {"knowledge_status": "current"},
+      "expected_status": "answered",
+      "expected_doc_groups": [["KB014", "KB017"]],
+      "allowed_versions": ["2.0"],
+      "allowed_knowledge_statuses": ["current"],
+      "reference_points": ["不能凭预览推断全量", "保留来源和截断标记，使用完整统计、分页或定点读取取得证据"]
+    },
+    {
+      "case_id": "W7D6-13",
+      "question": "2.0 版只读请求最多尝试多少次？哪些失败不自动重试？",
+      "filters": {"knowledge_status": "current"},
+      "expected_status": "answered",
+      "expected_doc_groups": [["KB013"]],
+      "allowed_versions": ["2.0"],
+      "allowed_knowledge_statuses": ["current"],
+      "reference_points": ["最多尝试 2 次，包含首次，即最多自动重试 1 次", "403、404、无效 JSON 和业务参数校验失败不自动重试"]
+    },
+    {
+      "case_id": "W7D6-14",
+      "question": "INFO 级日志正文中出现 NO_ERROR 或 ERROR_COUNTER，应该计为错误吗？",
+      "filters": {"knowledge_status": "current"},
+      "expected_status": "answered",
+      "expected_doc_groups": [["KB017"]],
+      "allowed_versions": ["2.0"],
+      "allowed_knowledge_statuses": ["current"],
+      "reference_points": ["只看级别字段是否精确等于 ERROR", "正文出现相关子串不改变 INFO 级别"]
+    },
+    {
+      "case_id": "W7D6-15",
+      "question": "任务 12345 现在已经完成了吗？请给出当前状态。",
+      "filters": {"knowledge_status": "current"},
+      "expected_status": "insufficient",
+      "expected_doc_groups": [],
+      "allowed_versions": ["2.0"],
+      "allowed_knowledge_statuses": ["current"],
+      "reference_points": ["知识库没有该任务的当前状态", "应说明需要实时 API，不能编造完成或失败状态"]
+    }
+  ]
+}
