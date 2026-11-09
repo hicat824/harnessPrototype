@@ -2,7 +2,7 @@
 
 三个学习重点：批量编码、单位向量点积、按相似度取 Top-K。
 数值运算使用标准库；画图需要 matplotlib，通过 httpx 调用本地 Ollama 模型。
-示例、运行命令和逐测试说明见 rag/README_day3.md。
+示例、运行命令和逐测试说明见 rag/week7.md#day3。
 """
 
 from dataclasses import asdict

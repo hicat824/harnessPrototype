@@ -2,7 +2,7 @@
 
 默认执行框架和 HTTP Mock 自检，并生成一张人工向量热力图；
 设置 RUN_WEEK7_DAY3=1 启用算法测试。真实模型还需 RUN_WEEK7_DAY3_MODEL=1。
-数据来源、运行方式和每项验收边界见 rag/README_day3.md。
+数据来源、运行方式和每项验收边界见 rag/week7.md#day3。
 """
 
 import copy

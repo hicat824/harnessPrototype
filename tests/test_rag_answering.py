@@ -2,7 +2,7 @@
 
 普通测试只使用固定向量、固定回答和 HTTP Mock，不读取真实密钥或访问模型。
 RUN_WEEK7_DAY5=1 启用完整离线流程；真实测试还需 RUN_WEEK7_DAY5_LLM=1。
-逐测试说明和产物路径见 rag/README_day5.md。
+逐测试说明和产物路径见 rag/week7.md#day5。
 """
 
 import copy

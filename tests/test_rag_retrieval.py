@@ -2,7 +2,7 @@
 
 默认运行保存/加载等自检；RUN_WEEK7_DAY4=1 启用完整离线流程测试。
 真实 Ollama 查询另外需要 RUN_WEEK7_DAY4_MODEL=1，不会在普通测试中运行。
-每个测试的数据、检查点和输出见 rag/README_day4.md。
+每个测试的数据、检查点和输出见 rag/week7.md#day4。
 """
 
 import copy

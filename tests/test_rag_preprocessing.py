@@ -2,7 +2,7 @@
 
 数据来源：tmp_path 中的合成小文档，以及 Week7 已准备的 18 份知识文件。
 JSON/定位辅助代码默认自检；完整处理流程需 RUN_WEEK7_DAY2=1 才执行。
-不请求 LLM、不下载模型；每个测试的来源、流程与产物见 rag/README.md。
+不请求 LLM、不下载模型；每个测试的来源、流程与产物见 rag/week7.md#day2。
 """
 
 import copy
@@ -22,7 +22,7 @@ from rag.preprocessing import (
 
 DAY2 = pytest.mark.skipif(
     os.environ.get("RUN_WEEK7_DAY2") != "1",
-    reason="Week7 Day2 完整验收需设置 RUN_WEEK7_DAY2=1；说明见 rag/README.md",
+    reason="Week7 Day2 完整验收需设置 RUN_WEEK7_DAY2=1；说明见 rag/week7.md#day2",
 )
 SAMPLE_ROOT = Path(os.environ.get(
     "WEEK7_RAG_DATASET", "/media/xumaozhou/data/AI/local_agent_test/week7_rag_basics",
