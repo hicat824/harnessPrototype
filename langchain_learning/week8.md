@@ -1,10 +1,10 @@
 # Week8：LangChain 学习
 
 > 基准计划：`/home/xumaozhou/Music/agent_engineer_learning_plan_v4_mcp.md`。
-> 当前进度（2026-11-10）：**Day1、Day2 已完成，当前进入 Day3：LangChain Tools、Pydantic 与 Agent**。
+> 当前进度（2026-11-10）：**Day1～Day3 已完成；下一阶段为 Day4：Document、Loader、Text Splitter 与 Embedding**。
 > 本目录为独立练习，测试仍放在仓库 `tests/`。主项目的 Agents SDK 和 Week7 RAG 保持现有实现。
 
-Day2 的完成记录、运行命令和逐项测试说明见 [Day2 章节](#day2)；下一阶段安排见 [Day3 章节](#day3)。
+Day2 的完成记录见 [Day2 章节](#day2)；Day3 的完成记录、代码入口和逐项测试见 [Day3 章节](#day3)。
 
 ## Day1 完成记录
 
@@ -692,9 +692,23 @@ langchain_learning/.venv/bin/python -B -m langchain_learning.day2 --real-llm \
 
 <a id="day3"></a>
 
-## Day3：LangChain Tools、Pydantic 与 Agent（当前）
+## Day3：LangChain Tools、Pydantic 与 Agent（已完成）
 
-Day2 学习已完成，下一步进入工具与 Agent。本节先记录学习和验收范围，Day3 代码与测试尚未准备。
+实现：[day3.py](day3.py)。测试：[test_week8_day3.py](../tests/test_week8_day3.py)。
+三个关键步骤及本日验收均已完成。使用同一 Week6 Mock 业务层理解工具参数与 Agent 循环。
+
+### Day3 完成记录
+
+- 任务 ID 的 ASCII 数字约束、两个带 args_schema 的 Tool 及 create_agent 组装均已实现。
+- system_prompt 已显式传入 DAY3_INSTRUCTIONS，模型实际输入和报告中的规则一致。
+- 当前代码完整离线验收：36 passed、4 skipped；跳过项均为显式真实模型用例。
+- 用户运行四项真实模型测试并确认通过；助手已逐份核对工具参数、业务结果和最终回答。
+- task：原样传入字符串 12345，回答 RUNNING，并区分查询 status 与任务 data.state。
+- engine：精确查询 import_std、limit=3，返回原序前三条；回答明确总数为 12、本次仅为部分记录。
+- missing：缺少 ID/编码时追问，没有生成工具调用或请求业务 API。
+- not_found：原样查询 99999，正确解释 NOT_FOUND，不据此猜测任务执行状态。
+- 四项 execution_status 均为 succeeded；三项查询各调用一次工具，缺参场景零工具调用。查询场景各有两条模型响应，缺参场景一条。
+- 报告位于 `artifacts/day3/real_model/`。本次收尾没有重复调用真实模型；产物和虚拟环境不提交。
 
 | 学习内容 | 练习及验收目标 |
 |---|---|
@@ -703,5 +717,308 @@ Day2 学习已完成，下一步进入工具与 Agent。本节先记录学习和
 | 简单 Agent | 观察问题 → 模型生成工具调用 → 程序执行 → ToolMessage → 模型回答的完整过程 |
 | 与 Agents SDK 对照 | 说明 LangChain 工具封装与 SDK `@function_tool` 的共同职责，以及 Agent 与单次模型调用的区别 |
 
-继续使用独立学习目录，业务响应采用 Mock；真实 LLM 用例后续单独显式启用。
+继续使用独立学习目录，业务响应采用 Mock；真实 LLM 用例仍通过独立开关显式启用。
 验收重点是工具选择、参数校验、执行轨迹与回答依据。本日不接入 RAG，也不迁移主项目编排。
+
+### Day3 环境与复用关系
+
+`requirements.txt` 已补充 `langchain==1.4.9`，用于 `create_agent`；保留既有 core/openai 版本。
+另固定 `mcp==2.1.1`，原因是复用的 `week6.py` 在模块顶部导入 MCP 类型；本日不启动 MCP Server 或子进程。
+本轮已安装到 Week8 独立环境，主项目 `.venv` 不变。以后重建环境仍执行：
+
+```bash
+langchain_learning/.venv/bin/python -m pip install -r langchain_learning/requirements.txt
+```
+
+| 代码 | 本日职责 |
+|---|---|
+| `week6.py` | 复用 TASKS、BusinessService、BusinessAPIClient、Mock HTTP、权限判断和结果限长 |
+| `langchain_learning/day1.py` | 复用 DeepSeek 的 ChatOpenAI 适配器，不新增模型配置 |
+| `langchain_learning/day3.py` | 参数模型、工具包装、Agent 组装与轨迹报告 |
+| `tests/test_week8_day3.py` | 已提供的离线模型脚本、断言、真实测试与开关 |
+
+`langchain.tools.tool`、`langchain.agents.create_agent` 都是第三方接口，已在 day3.py 顶部导入。
+高层 Agent 内部使用 LangGraph，本日只使用它完成最小工具循环，不提前学习状态图设计或持久化。
+
+### 已完成的三个步骤：输入、输出与边界
+
+| 标识与位置 | 输入 | 已完成的实现 | 输出或效果 |
+|---|---|---|---|
+| `W8D3-1`，QueryTaskInput.task_id | strict 配置及字符串字段 | Field.pattern 限制全串为一个或多个 ASCII 数字 | Schema 可展示格式约束；拒绝 abc、空白和全角数字，保留 00123 |
+| `W8D3-2`，build_tools | service、两个已有查询函数、两种参数模型 | tool 通过 args_schema 分别包装两个函数 | 返回两个 BaseTool，支持 invoke/ainvoke；校验通过才执行函数 |
+| `W8D3-3`，build_agent | model、tools、DAY3_INSTRUCTIONS | create_agent 显式接收 model、tools、system_prompt | 返回可执行 Agent，创建时不请求模型或业务接口 |
+
+三个位置均已实现并通过离线验收。Mock API、HTTP 错误映射、报告和测试模型沿用框架代码，Agent Loop 由 LangChain 编排。
+
+参数约定：
+
+- `task_id`：严格字符串，全串 ASCII 数字；`"00123"` 保持原样，不能转成整数。strict 拒绝整数和 bool，pattern 约束字符串内容。
+- `engine_code`：非空、非纯空白的字符串，按字段精确匹配，不 strip 或归一化后再查询。
+- `limit`：真正的整数，范围 1～100，默认 100；字符串 `"3"` 和 bool 均拒绝。
+- `service/client/token`：由程序提供和管理，不进入模型填写的工具参数。
+
+工具函数已经返回 BusinessResult 的 JSON 字符串，含 status/source/data/error_code/truncated 等。
+`args_schema` 约束输入；业务输出的校验和限长复用已有层，不把输入 Schema 当作输出 Schema。
+本日 Agent 最终返回自然语言文本，不增加一套最终回答 JSON 规范。
+
+### Day3 工作流
+
+```mermaid
+flowchart TB
+    question["本轮问题"] --> agentModel["Agent 调用模型，提供规则和 Tool Schema"]
+    agentModel --> decision{"是否生成工具调用"}
+    decision -->|"否"| answer["AIMessage：回答或追问缺失参数"]
+    decision -->|"是"| validate["Pydantic 校验工具参数"]
+    validate -->|"合法"| business["BusinessService → BusinessAPIClient"]
+    business --> mockHttp["HTTPX MockTransport：Week6 固定数据"]
+    mockHttp --> toolResult["BusinessResult JSON → ToolMessage"]
+    validate -->|"非法"| toolError["error ToolMessage：参数反馈"]
+    toolResult --> agentModel
+    toolError --> agentModel
+    answer --> report["返回状态消息和最终回答，按需保存轨迹报告"]
+```
+
+Day2 是固定 `prompt → model → parser`；Day3 的 Agent 会根据模型返回决定是否执行工具，再把结果传回模型。
+通常一次查询经历两次模型响应，但这不是固定次数；参数修正会增加轮次，缺参追问可完全不调用业务工具。
+
+必须区分三类结果：
+
+1. **直接工具校验失败**：`tool.invoke` 抛 ValidationError，业务函数与 HTTP 都未执行。
+2. **Agent 内的参数校验失败**：当前框架会返回 error ToolMessage，模型可以修改参数再请求；是否修改取决于后续模型响应，不是工具自动重试 HTTP。
+3. **业务查询返回 NOT_FOUND/FORBIDDEN**：这是合法的业务 JSON。ToolMessage 本身可能为 success，但其 JSON 中的 status=error；不能把工具执行成功等同于业务查询成功。
+
+模型异常、未处理的程序异常和图步数超限会向外抛出，本日没有添加通用修复中间件。
+`recursion_limit` 限制图执行步数，不等同于工具次数；另有整体 timeout_seconds，均由提供的 run_agent 管理。
+
+### 测试数据来源
+
+| 数据 | 来源及含义 |
+|---|---|
+| 任务 12345 | Week6 TASKS，alice 可读，data.state=RUNNING，engineCode=import_std |
+| import_std 前 3 条 | Week6 Mock 中 alice 可见共 12 条，按原顺序返回 12345/20000/20001，status=partial |
+| 任务 34567 | 属于 bob，alice 查询得到 FORBIDDEN |
+| 任务 99999 / 00123 | Mock 中不存在，返回 NOT_FOUND；00123 同时验证前导零原样传递 |
+| engine_not_found | 查询成功但无记录，status=empty |
+| 模型离线响应 | tests 文件中的 ScriptedModel，按脚本依次返回 AIMessage 工具调用和最终文本 |
+| 模型真实响应 | 沿用 DeepSeek；只替换模型，业务接口仍是同一套 Mock |
+
+没有新增数据目录，所需固定数据已在 week6.py 和本测试中。
+ScriptedModel 基于 LangChain GenericFakeChatModel，补充 Agent 需要的 bind_tools；不访问网络。
+离线脚本只能证明调度、校验与消息传递，不能证明模型会自行选择正确工具或进行参数修正。
+
+### 命令、报告与检查顺序
+
+以下命令均在仓库根目录执行，使用 `langchain_learning/.venv/bin/python`。
+
+**第一步：基础部分的独立自检。**
+
+```bash
+RUN_WEEK8_DAY3=0 RUN_WEEK8_DAY3_LLM=0 \
+langchain_learning/.venv/bin/python -B -m pytest tests/test_week8_day3.py \
+-q -s -p no:cacheprovider
+```
+
+框架准备阶段自检：11 passed、29 skipped。此命令仅检查基础部分，跳过完整流程的 25 项和真实模型 4 项。
+新增依赖后的 Day1、Day2 完整离线回归：62 passed、3 skipped；三条真实模型用例均未启用。
+
+**第二步：当前实现的完整离线验收。**
+
+```bash
+RUN_WEEK8_DAY3=1 RUN_WEEK8_DAY3_LLM=0 \
+langchain_learning/.venv/bin/python -B -m pytest tests/test_week8_day3.py \
+-q -s -p no:cacheprovider
+```
+
+当前仓库实现已通过完整离线验收：36 passed、4 skipped，四项真实模型用例未启用。
+
+**第三步：离线通过后，显式启用真实模型。**
+
+```bash
+RUN_WEEK8_DAY3=1 RUN_WEEK8_DAY3_LLM=1 \
+langchain_learning/.venv/bin/python -B -m pytest \
+tests/test_week8_day3.py::test_real_agent_selects_tool_and_preserves_arguments \
+-v -s -p no:cacheprovider
+```
+
+需要既有 DeepSeek OPENAI_API_KEY。参数化运行四个问题；一次 Agent 任务可能调用模型多次。
+用户已运行并确认四项通过，助手已对照各份 ToolMessage 复核最终回答；本次收尾未重复执行。
+后续重跑仍需显式启用。业务数据保持 Mock，不连接真实业务系统；自动断言不能替代对回答内容的复核。
+
+也可独立运行一次真实模型 + Mock 业务演示：
+
+```bash
+langchain_learning/.venv/bin/python -B -m langchain_learning.day3 --real-llm \
+  --question '查询任务 12345 的状态，并说明来源。'
+```
+
+| 输出文件 | 由哪个测试生成 | 内容 |
+|---|---|---|
+| artifacts/day3/offline/tool_schemas.json | 测试六 | 工具名称、说明、输入 Schema |
+| artifacts/day3/offline/query_report.json | 测试九 | 完整的一次查询轨迹 |
+| artifacts/day3/offline/correction_report.json | 测试十 | 非法参数反馈、脚本修正后的调用与结果 |
+| artifacts/day3/real_model/task_report.json | 测试十四，task | 真实模型按 ID 查询 |
+| artifacts/day3/real_model/engine_report.json | 测试十四，engine | 真实模型按编码查询部分列表 |
+| artifacts/day3/real_model/missing_report.json | 测试十四，missing | 缺 ID 时不调用工具的回答 |
+| artifacts/day3/real_model/not_found_report.json | 测试十四，not_found | 未找到任务时的工具结果和回答 |
+| artifacts/day3/real_model/cli_report.json | CLI | 命令行单次真实演示 |
+| failure_report.json / step_limit_report.json | 测试四 / 十三，pytest 临时目录 | 运行异常或步数限制的错误类型 |
+
+固定路径均相对于 langchain_learning/。pytest 可用 WEEK8_DAY3_OUTPUT 改输出根目录；CLI 使用 --output。
+产物沿用 artifacts 忽略规则，不提交；模型调用关闭本次 LangSmith 远程追踪。
+
+报告阅读方式：
+
+- `messages` 是 Agent 返回的状态消息，通常为 human → ai(tool_calls) → tool → ai；system_prompt 在模型节点注入，另记为 instructions。
+- `tool_calls` 保存名称、参数和原始 id；`tool_results` 的 call_id 与之配对，content 为业务 JSON 或框架校验反馈。
+- `final_answer` 是最后一条 AIMessage 文本；有答案不代表答案语义已正确。
+- `usage` 在所有返回 AIMessage 都含实际 usage 时才相加，否则保持 null。离线假模型不提供 usage。
+- 运行失败时保存本次错误类型并覆盖旧报告；Agent 未返回完整状态时，不伪造中断前轨迹。输入参数无效时不开始执行，也不写报告。
+
+### 测试一（Day3）：已提供的列表参数约束
+
+函数：`test_provided_engine_schema_rejects_invalid_arguments`，默认执行，八组输入。
+
+- **数据来源**：空编码、错误类型、非法条数、bool、字符串条数和额外 token 字段。
+- **流程**：直接调用 QueryTasksInput；同时检查默认 limit 和编码原文。
+- **检查点**：类型严格、范围有效、拒绝额外参数；保留字符串原值。
+- **输出**：pytest 结果，无文件，不执行工具。
+
+### 测试二（Day3）：复用的业务数据与精确查询
+
+函数：`test_provided_business_data_is_same_week6_mock`，默认执行。
+
+- **数据来源**：Week6 的任务 12345 与 import_std 列表。
+- **流程**：直接调用 Service → Client → Mock HTTP。
+- **检查点**：RUNNING 状态正确；精确编码匹配、列表原序、total=12、只返回 3 条且标记 partial；请求均为 GET。
+- **输出**：pytest 结果，无文件，不调用模型。
+
+### 测试三（Day3）：CLI 显式真实开关
+
+函数：`test_provided_cli_requires_explicit_real_flag`，默认执行。
+
+- **数据来源**：只有 question、没有 --real-llm 的子进程命令。
+- **流程**：进入 CLI，在创建模型前拒绝。
+- **检查点**：明确提示开关，Agent 构造和真实请求都不会执行。
+- **输出**：pytest 和 CLI 提示，无报告。
+
+### 测试四（Day3）：执行异常记录
+
+函数：`test_provided_runner_saves_safe_failure_without_fake_usage`，默认执行。
+
+- **数据来源**：已提供的 BrokenAgent，抛 RuntimeError；异常正文包含不应导出的示例内容。
+- **流程**：run_agent 执行失败 → 保存报告 → 继续向外抛出。
+- **检查点**：只记录异常类型，不包含任意异常正文；答案和 usage 均为 null。
+- **输出**：pytest 临时目录 failure_report.json。
+
+### 测试五（Day3）：任务 ID 的格式与身份
+
+函数：`test_task_id_schema_preserves_string_identity_and_rejects_invalid_values`，设置 RUN_WEEK8_DAY3=1 时启用，八组非法输入。
+
+- **数据来源**：空白、字母、前后空格、全角数字、整数、bool 和 None，以及合法 00123。
+- **流程**：调用 QueryTaskInput，使用 Field.pattern 约束。
+- **检查点**：只接收全串 ASCII 数字字符串，保留前导零。
+- **输出**：pytest 结果，无文件，不请求 API。
+
+### 测试六（Day3）：工具定义及输入 Schema
+
+函数：`test_tool_schemas_names_descriptions_and_program_side_dependencies`，设置 RUN_WEEK8_DAY3=1 时启用。
+
+- **数据来源**：build_tools 产生的两个 BaseTool。
+- **流程**：导出工具名、说明、Schema，不执行工具。
+- **检查点**：字段、必填参数、默认值和 pattern 正确，禁止额外字段；客户端、权限和 Token 没有成为模型参数。
+- **输出**：offline/tool_schemas.json。
+
+### 测试七（Day3）：直接工具调用的业务结果与配对
+
+函数：`test_direct_tools_keep_business_contract_and_call_id`，设置 RUN_WEEK8_DAY3=1 时启用，六种业务场景。
+
+- **数据来源**：正常任务、前导零 ID、无权限、不存在、空列表和截断列表。
+- **流程**：给工具传入带 name/args/id/type 的 ToolCall 字典 → Service → Mock HTTP → ToolMessage。
+- **检查点**：call_id 保留；业务状态、错误码和来源保留；原始参数不变；不返回 Token/owner；每次一次 HTTP。
+- **输出**：pytest 结果，无文件。
+
+### 测试八（Day3）：直接调用时参数错误先于业务执行
+
+函数：`test_direct_tool_validation_stops_before_service_and_http`，设置 RUN_WEEK8_DAY3=1 时启用，五组错误。
+
+- **数据来源**：缺 ID、字母 ID、整数 ID、额外 token 和 bool limit。
+- **流程**：通过 tool.invoke 传参数，并记录是否进入 Service 和 HTTP。
+- **检查点**：抛 ValidationError，业务函数与 HTTP 都未执行。
+- **输出**：pytest 结果，无文件。
+
+### 测试九（Day3）：Agent 完整工具循环
+
+函数：`test_agent_tool_loop_records_result_before_final_answer`，设置 RUN_WEEK8_DAY3=1 时启用。
+
+- **数据来源**：假模型先请求 query_task(12345)，再返回固定回答；业务查询用真实 Mock 链路。
+- **流程**：构造 Agent → 第一条 AIMessage 工具调用 → ToolMessage → 第二条 AIMessage 最终回答。
+- **检查点**：构造阶段没有请求；两种工具已绑定；规则注入实际模型输入；第二次模型输入包含工具结果；call_id 配对，一次 HTTP。
+- **输出**：offline/query_report.json。
+
+### 测试十（Day3）：Agent 内的参数反馈与修正
+
+函数：`test_agent_validation_feedback_allows_a_scripted_correction`，设置 RUN_WEEK8_DAY3=1 时启用。
+
+- **数据来源**：脚本先传整数 12345，再改为字符串，最后回答。
+- **流程**：第一次参数校验失败生成 error ToolMessage；下一次合法调用进入业务层。
+- **检查点**：两条 ToolMessage 的状态分别 error/success，保留各自 call_id；模型响应三次，HTTP 只有一次。
+- **输出**：offline/correction_report.json。脚本修正不代表真实模型一定能修正。
+
+### 测试十一（Day3）：缺参数时不查询
+
+函数：`test_missing_id_asks_without_calling_business_api`，设置 RUN_WEEK8_DAY3=1 时启用。
+
+- **数据来源**：没有 ID 的问题，假模型返回追问。
+- **流程**：Agent 直接结束，不产生工具调用。
+- **检查点**：无 ToolCall、ToolMessage 或 HTTP；保留追问文本。
+- **输出**：pytest 结果，无文件。
+
+### 测试十二（Day3）：独立任务不自动共享历史
+
+函数：`test_repeated_agent_runs_do_not_automatically_share_history`，设置 RUN_WEEK8_DAY3=1 时启用。
+
+- **数据来源**：同一个 Agent 的两个独立问题、两条固定回答。
+- **流程**：先后两次 run_agent，每次只提供本轮 HumanMessage。
+- **检查点**：第二次模型输入只有规则和第二个问题，没有第一次内容；没有配置 Checkpointer 或 Session。
+- **输出**：pytest 结果，无文件。
+
+### 测试十三（Day3）：限制无法结束的工具循环
+
+函数：`test_graph_step_limit_stops_repeated_tool_calls`，设置 RUN_WEEK8_DAY3=1 时启用。
+
+- **数据来源**：假模型连续返回合法查询调用，不给最终回答。
+- **流程**：run_agent 使用 recursion_limit=3，达到图步数限制后抛出 GraphRecursionError。
+- **检查点**：没有无限循环；记录实际异常类型，不猜测未返回的 usage。
+- **输出**：pytest 临时目录 step_limit_report.json。
+
+### 测试十四（Day3）：真实模型选择工具和传递参数
+
+函数：`test_real_agent_selects_tool_and_preserves_arguments`，需额外开启真实开关，四个问题。
+
+| 场景 | 输入 | 自动检查 |
+|---|---|---|
+| task | 查询任务 12345 | query_task，字符串 ID 正确，查询 success |
+| engine | import_std 前 3 条 | query_tasks_by_engine，编码和 limit 正确，查询 partial |
+| missing | 只有查询意图，缺任务 ID | 不产生工具调用或业务 HTTP |
+| not_found | 查询 99999 | 原样传递 ID，业务返回 error/NOT_FOUND |
+
+- **数据来源**：模型为既有 DeepSeek，业务为同一 Week6 MockTransport。
+- **流程**：问题 → 自主选择工具和参数 → 实际工具执行 → 最终回答 → 保存报告。
+- **检查点**：任务正常结束；有参数的场景恰好一次匹配工具调用，缺参场景零调用；校验原始参数与实际业务结果。
+- **输出**：real_model/task_report.json、engine_report.json、missing_report.json、not_found_report.json。
+- **语义复核**：确认 RUNNING 的来源、列表总数/截断说明、缺参时的追问，以及 NOT_FOUND 没有被解释成任务失败。自动通过不替代这一步。
+
+### 与 Agents SDK 的对照与 Day3 完成标准
+
+| 对照点 | LangChain 本日练习 | 既有 Agents SDK |
+|---|---|---|
+| 工具封装 | tool + args_schema | @function_tool 根据函数定义生成工具 |
+| 参数约束 | 显式 Pydantic 模型 | SDK 生成的工具 Schema、既有参数及业务校验 |
+| 隐藏业务依赖 | 闭包捕获 service | 项目既有工具通过 context 获取依赖 |
+| 执行编排 | create_agent 返回可执行对象 | Agent 定义 + Runner.run |
+| 工具轨迹 | AIMessage.tool_calls 和 ToolMessage.tool_call_id | Function Call、Function Call Output 及 call_id |
+
+这张表是接口职责对照，不是两套 SDK 的无损转换器，也没有在本日重新运行 Agents SDK。
+本日已通过离线用例与显式真实用例。复盘时能拿轨迹解释参数由谁生成、由谁校验、业务结果如何回到模型，以及工具执行状态和业务查询状态的区别。
+
+官方资料：[Tools](https://docs.langchain.com/oss/python/langchain/tools)、[Agents](https://docs.langchain.com/oss/python/langchain/agents)、[工具循环的离线测试](https://docs.langchain.com/oss/python/langchain/test/unit-testing)。
