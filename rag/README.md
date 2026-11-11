@@ -13,4 +13,10 @@ Week7 Day1～Day7 已完成，完整学习内容已汇总到 [week7.md](week7.md
 - [Day6：最小 RAG Evals 与错误分析](week7.md#day6)
 - [Day7：端到端最小 RAG 周验收](week7.md#day7)
 
-本文件用于目录导航，学习内容与逐项测试说明统一维护在 `week7.md` 中。
+## Week8：LangChain 版知识库组件
+
+- [Day4：Document、Loader、Text Splitter 与 Embeddings（已完成）](../langchain_learning/week8.md#day4)
+- 实现：[langchain_preparation.py](langchain_preparation.py)，测试：[test_week8_day4.py](../tests/test_week8_day4.py)。
+- 沿用 Week7 同一知识集；实现放在 `rag/`，运行使用 Week8 独立环境。
+
+本文件用于目录导航。Week7 学习内容与逐项测试维护在 `week7.md`，Week8 对应说明维护在 `langchain_learning/week8.md`。

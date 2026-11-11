@@ -1,10 +1,10 @@
 # Week8：LangChain 学习
 
 > 基准计划：`/home/xumaozhou/Music/agent_engineer_learning_plan_v4_mcp.md`。
-> 当前进度（2026-11-10）：**Day1～Day3 已完成；下一阶段为 Day4：Document、Loader、Text Splitter 与 Embedding**。
-> 本目录为独立练习，测试仍放在仓库 `tests/`。主项目的 Agents SDK 和 Week7 RAG 保持现有实现。
+> 当前进度（2026-11-11）：**Day1～Day4 已完成；下一阶段为 Day5：Vector Store、Retriever 与 RAG 重构**。
+> Week8 使用独立环境；知识库代码放在 `rag/`，关联测试放在 `tests/`。主项目的 Agents SDK 和 Week7 既有实现保持原样。
 
-Day2 的完成记录见 [Day2 章节](#day2)；Day3 的完成记录、代码入口和逐项测试见 [Day3 章节](#day3)。
+工具学习见 [Day3 章节](#day3)；Day4 完成记录、代码入口和逐项测试见 [Day4 章节](#day4)。
 
 ## Day1 完成记录
 
@@ -1022,3 +1022,362 @@ langchain_learning/.venv/bin/python -B -m langchain_learning.day3 --real-llm \
 本日已通过离线用例与显式真实用例。复盘时能拿轨迹解释参数由谁生成、由谁校验、业务结果如何回到模型，以及工具执行状态和业务查询状态的区别。
 
 官方资料：[Tools](https://docs.langchain.com/oss/python/langchain/tools)、[Agents](https://docs.langchain.com/oss/python/langchain/agents)、[工具循环的离线测试](https://docs.langchain.com/oss/python/langchain/test/unit-testing)。
+
+<a id="day4"></a>
+
+## Day4：Document、Loader、Text Splitter 与 Embeddings（已完成）
+
+实现：[rag/langchain_preparation.py](../rag/langchain_preparation.py)。测试：[test_week8_day4.py](../tests/test_week8_day4.py)。
+本日已把 Week7 的文档准备流程接到 LangChain 组件接口，三个学习点及四处关键实现均已完成。
+
+### Day4 完成记录
+
+- 已实现原文/元数据到 Document 的转换、Text Splitter 构造及两种 Embedding 入口。
+- 当前代码完整离线验收：35 passed、1 skipped；跳过项为显式真实 Ollama 测试。
+- 用户运行真实本地测试并确认通过，包含首块向量与 Week7 入口的数值对照；助手本轮读取产物复核，没有重复推理。
+- 真实报告：18 份来源文件 → 20 个正文单元 → 64 个 Chunk，same_chunks=true；正文、ID、顺序和完整元数据与 Week7 一致。
+- qwen3-embedding:0.6b 返回 64 条正文向量和 1 条问题向量，均为 1024 维；Chunk ID 对应、维数、有限性和非零检查通过。
+- 对照报告和向量保存在 `artifacts/day4/local_model/`，模型及运行产物不提交。
+- 本日只完成文档准备与编码；检索及回答质量留到 Day5 和后续学习，不把向量格式正确等同于语义质量通过。
+
+### 今天学习什么、验收什么
+
+| 学习内容 | 可展示的验收结果 |
+|---|---|
+| Document | 能区分 page_content 正文、metadata 来源信息及 id；转换时不丢版本、scope 和 JSONPath |
+| Loader | 通过 BaseLoader 的 load/lazy_load 按同一清单加载，说明为什么不能递归扫描整个练习目录 |
+| Text Splitter | 理解字符长度、重叠、分隔符和 start_index；不跨标题节或正文单元混块，保留流程元数据 |
+| Embeddings 接口 | 正文批量 embed_documents 返回二维数组；问题 embed_query 返回一维向量 |
+| 与 Week7 对照 | 对同一语料和规则检查块正文、数量、ID、元数据和位置，而不是只看“代码能运行” |
+
+本日止于 Document → Chunk → 向量，不建索引、不检索、不调用回答模型或 Agent。
+向量库和 Retriever 是 Day5 内容；Day4 不需要 DeepSeek Key，也没有在线回答型 LLM 测试。
+
+### 文件、依赖和复用边界
+
+| 文件或组件 | 本日职责 |
+|---|---|
+| rag/langchain_preparation.py | 自定义 Loader、Document 转换、LangChain 节内分块、Embeddings 适配和报告 |
+| rag/preprocessing.py | 复用清单校验、保守清洗、JSON 正文适配、标题/代码围栏规则和定位；同时作为 Week7 对照路径 |
+| rag/embeddings.py | 复用既有 OllamaEncoder、query 前缀及向量校验，不重新实现 HTTP |
+| tests/test_week8_day4.py | 提供合成文件、人工向量、Mock HTTP、断言及真实本地模型开关 |
+
+新增依赖只有 `langchain-text-splitters==1.1.3`，已检查与既有 core 版本兼容并安装到独立环境。
+新增依赖后的 Day1～Day3 完整离线回归：98 passed、7 skipped；七项真实模型用例均未启用。
+以后重新安装使用：
+
+```bash
+langchain_learning/.venv/bin/python -m pip install -r langchain_learning/requirements.txt
+```
+
+本日不安装 langchain-community 或另一套 Ollama 适配包：ManifestLoader 遵循 BaseLoader 接口，读取规则由现有清单决定；Week7Embeddings 遵循 Embeddings 接口，后端仍是已有模型。
+这样保留相同数据结构、模型和查询前缀，也方便 Day5 接入要求 Embeddings 对象的组件。
+
+### 已完成的三个学习点与四处关键实现
+
+| 标识 | 函数 | 输入 | 已完成的输出 |
+|---|---|---|---|
+| W8D4-1 | to_document | KnowledgeDocument；已复制 metadata 并补充 doc_id/segment_id/section_path | Document，id 为 doc_id:segment_id，page_content 保留原文，metadata 使用已准备的副本 |
+| W8D4-2 | make_splitter | 已校验的 max_chars/overlap/mode，以及 options 字典 | 用 options 构造 RecursiveCharacterTextSplitter |
+| W8D4-3a | Week7Embeddings.embed_documents | list[str] 正文和 self.encoder | 调用 embed_texts 的 document 入口，返回 list[list[float]] |
+| W8D4-3b | Week7Embeddings.embed_query | str 问题和 self.encoder | 将问题作为单元素列表交给 query 入口，再返回对应的一维 list[float] |
+
+四处均已实现并通过离线验收；Loader 主循环、标题解析、HTTP、向量校验和报告保存复用已提供代码。
+Document、RecursiveCharacterTextSplitter、Embeddings 均为文件顶部已导入的 LangChain 接口；embed_texts 是 Week7 既有函数。
+
+### 数据如何流动
+
+```mermaid
+flowchart TB
+    manifest["同一份 Week7 manifest.json"] --> loader["ManifestLoader：只读清单中的正文"]
+    loader --> documents["Document：原文 + 来源元数据 + 单元 ID"]
+    documents --> sections["复用 Week7 保守清洗与标题分节"]
+    sections --> splitter["LangChain Text Splitter：仅拆分节内正文"]
+    splitter --> chunks["Chunk Document：正文、版本、JSONPath、全局字符区间"]
+    manifest --> baseline["Week7 原加载和分块路径"]
+    baseline --> compare["对照数量、正文、元数据和位置"]
+    chunks --> compare
+    chunks --> documentEmbedding["embed_documents：批量正文向量"]
+    query["单个问题"] --> queryEmbedding["embed_query：问题向量"]
+    documentEmbedding --> encoder["同一 OllamaEncoder：Qwen3 Embedding"]
+    queryEmbedding --> encoder
+    compare --> reports["JSON 产物，不创建向量索引"]
+    encoder --> reports
+```
+
+Loader 的原文保持 BOM/CRLF 等不变；清洗只在分块阶段做，规则与 Week7 相同。
+标题解析仍复用 Week7；每个节内部的长度切分由 LangChain 执行，不是把 Week7 分好的最终块换一种对象类型。
+
+### 分块规则与位置的含义
+
+两种模式都先按 Week7 标题规则分节，代码围栏里的 `#` 不作标题；JSON 的 sections 分开处理。
+
+| 模式 | 节内规则 | overlap 的含义 | 用途 |
+|---|---|---|---|
+| aligned（默认） | separators 只含空字符串，按字符窗口切分 | 同一节内相邻窗口重叠固定字符数 | 与 Week7 相同规则对照 |
+| recursive | 优先段落、换行、中文句号等，最后按字符兜底 | 重叠目标上限，实际不一定满额 | 观察自然边界对切点的影响 |
+
+默认 max_chars=500、overlap=50，长度按 Python len(str) 计字符，不是 Token。
+`strip_whitespace=False`、`keep_separator=True` 保留正文；纯空白块按约定跳过。
+
+位置分两层：
+
+- `start_index` 是 LangChain 返回的**本节内**字符起点，仅作为中间结果。
+- Chunk metadata.start_char/end_char 是**清洗后的整个正文单元**中的左闭右开区间；代码会加回该节的起点。
+- MD/TXT 的 start_line/end_line 为源文件 1-based 行号；JSON 不使用拼接后的虚假行号，保留 json_path，行号为 null。
+- 文档单元 ID 如 KB001:body；Chunk ID 如 KB001:body:0000，同一 JSON 的 json-0/json-1 保持区分。
+
+当前实现的完整离线对照中，两种模式都得到 64 块且与 Week7 完全一致：这批内容在节内没有触发不同切点。
+因此专门提供了长段落合成测试来观察两种模式的差异，不能为了展示差异强行改动知识正文。
+
+### Embedding 的两个入口
+
+```text
+embed_documents([正文1, 正文2]) → [[向量1...], [向量2...]]
+embed_query(一个问题)          → [问题向量...]
+```
+
+底层 OllamaEncoder 的 document 入口直接编码正文，query 入口添加既有的 Qwen 检索说明。
+适配器不能把问题误走 document 入口，也不能把 metadata 或整个 Document 对象当正文编码。
+空文档列表不请求模型；非法文本、条数/维数不符、零向量、NaN 等由已有函数拒绝；模型异常向外抛出。
+
+### 测试数据从哪里来
+
+| 数据 | 来源 |
+|---|---|
+| 完整知识集 | `/media/xumaozhou/data/AI/local_agent_test/week7_rag_basics/manifest.json`，同一批 18 份文件：15 MD、2 TXT、1 JSON |
+| 正文单元 | 17 份文本 + JSON 的 3 个 section，共 20 个；默认规则共 64 块 |
+| 合成小语料 | 本测试 small_dataset 在 pytest 临时目录生成：MD/TXT/JSON，含 BOM、CRLF、标题、代码围栏、正文外说明和嵌套元数据 |
+| 长段落样例 | 测试内的中文段落，用于观察字符窗口与递归分隔的差异 |
+| 离线向量 | FixedEncoder 按文本长度返回三维人工向量，仅检查调用、顺序和绑定，不代表语义质量 |
+| HTTP 响应 | httpx.MockTransport 返回固定向量，检查同一 Qwen 前缀和请求格式，不连接 Ollama |
+| 真实推理 | 已安装的本地 Ollama 模型 qwen3-embedding:0.6b，不下载新模型，不请求在线生成服务 |
+
+可以用 WEEK7_RAG_DATASET 指向同一语料的其他目录；完整对照会核验 18/20/64 的既有基准。
+加载器只读清单文件，不扫描 README、问题集或参考答案。测试对源文件做哈希核对，确认没有改写。
+
+### 运行顺序与命令
+
+在仓库根目录执行。
+
+**第一步：辅助部分的独立自检。**
+
+```bash
+RUN_WEEK8_DAY4=0 RUN_WEEK8_DAY4_MODEL=0 \
+langchain_learning/.venv/bin/python -B -m pytest tests/test_week8_day4.py \
+-q -s -p no:cacheprovider
+```
+
+框架准备阶段自检：14 passed、22 skipped。此命令只检查辅助代码，跳过完整流程的 21 项和真实本地推理 1 项。
+
+**第二步：当前实现的完整离线验收。**
+
+```bash
+RUN_WEEK8_DAY4=1 RUN_WEEK8_DAY4_MODEL=0 \
+langchain_learning/.venv/bin/python -B -m pytest tests/test_week8_day4.py \
+-q -s -p no:cacheprovider
+```
+
+当前仓库实现已通过：35 passed、1 skipped，唯一跳过项为真实本地推理。
+此命令使用完整知识集做加载/分块对照，但向量使用人工值或 HTTP Mock，不进行真实模型推理。
+
+也可以只做加载、分块和对照，直接查看输出文件：
+
+```bash
+langchain_learning/.venv/bin/python -B -m rag.langchain_preparation \
+  --output langchain_learning/artifacts/day4/preprocess
+```
+
+改为 `--mode recursive` 可观察另一种节内切分方式；换模式时建议指定另一输出目录，便于对照。
+
+**第三步：离线通过后，显式运行真实本地 Embedding。**
+
+```bash
+RUN_WEEK8_DAY4=1 RUN_WEEK8_DAY4_MODEL=1 \
+langchain_learning/.venv/bin/python -B -m pytest \
+tests/test_week8_day4.py::test_local_ollama_embeddings_match_week7_backend \
+-v -s -p no:cacheprovider
+```
+
+需要已启动的 Ollama 服务及已拉取的 qwen3-embedding:0.6b。用户已运行并确认通过，助手已核对实际产物；本次收尾未重复执行。
+该测试编码 64 个正文块、一个问题，并额外编码第一块与 Week7 入口做数值对照；不评估检索或回答质量。
+本日真实开关叫 MODEL，不是 LLM；不需要 OPENAI_API_KEY。
+
+### 输出文件与阅读方式
+
+预处理 CLI 默认输出到 `langchain_learning/artifacts/day4/preprocess/`；完整语料测试分别写入 aligned/ 和 recursive/；真实测试写入 local_model/。
+pytest 可以通过 WEEK8_DAY4_OUTPUT 改根目录，CLI 使用 --output。
+
+| 文件名 | 内容 | 由哪些测试/流程产生 |
+|---|---|---|
+| documents.json | Loader 输出的正文原文、单元 ID 和元数据 | 测试十五/十六/十七、CLI |
+| chunks.json | LangChain 分块后的正文、Chunk ID 和位置元数据 | 同上 |
+| week7_chunks.json | Week7 原分块结果，使用同一导出格式 | 同上 |
+| comparison_report.json | 数量、same_chunks、逐单元对照、编码模式和实际维数 | 同上 |
+| embedded_chunks.json | 每个 chunk_id 对应的向量，顺序与 chunks.json 一致 | 测试十五的临时目录、测试十七；CLI 显式加 --local-model 时 |
+| query_embedding.json | 原始问题及一维问题向量 | 同上 |
+
+测试十五写 pytest 临时目录，其余固定产物仍在 Week8 的 artifacts 下，沿用忽略规则。
+`same_chunks` 比较顺序、ID、正文和完整元数据，不只比较数量。
+未提供 embeddings 时 embedding_mode=not_run、dimensions=null；人工向量标为 offline_fixture，真实编码标为 local_model。
+失败会向外抛出，不写成功产物；同目录的旧文件不会自动清空，阅读时以本次执行结果及 comparison_report 中的模式为准。
+
+### 测试一（Day4）：已提供的 Chunk 转换与定位
+
+函数：`test_provided_chunk_conversion_keeps_locations_and_isolates_metadata`，默认执行，MD/JSON 两组。
+
+- **数据来源**：测试内构造的 KnowledgeChunk，JSON 带 JSONPath。
+- **流程**：调用 chunk_document，再导出普通字典并修改元数据。
+- **检查点**：正文、ID、字符区间保留，嵌套元数据互相隔离。
+- **输出**：pytest 结果，无文件，不调用 Loader 主流程或模型。
+
+### 测试二（Day4）：分块配置的前置校验
+
+函数：`test_provided_split_options_fail_before_exercise`，默认执行，七组非法配置。
+
+- **数据来源**：非正长度、bool/小数长度、负重叠、重叠等于块长、bool 重叠和未知模式。
+- **流程**：调用 make_splitter，在构造对象前检查参数。
+- **检查点**：明确抛 ValueError，不让配置错误混入实际拆分。
+- **输出**：pytest 结果，无文件。
+
+### 测试三（Day4）：空列表与错误文档类型
+
+函数：`test_provided_empty_or_invalid_document_lists`，默认执行。
+
+- **数据来源**：空列表，以及混入普通字符串的列表。
+- **流程**：调用 split_documents。
+- **检查点**：空列表返回空列表；错误类型被拒绝，不创建 Splitter 或调用模型。
+- **输出**：pytest 结果，无文件。
+
+### 测试四（Day4）：运行配置先于加载校验
+
+函数：`test_provided_invalid_run_config_stops_before_loading`，默认执行，四组。
+
+- **数据来源**：不匹配的 embeddings/模式、缺模型标识和空白问题，数据集路径故意不存在。
+- **流程**：调用 run_preparation，在读取语料前检查参数。
+- **检查点**：抛 ValueError，不读文件、不产生输出目录。
+- **输出**：pytest 结果，无文件。
+
+### 测试五（Day4）：Document 的正文、身份与元数据
+
+函数：`test_document_conversion_preserves_raw_text_identity_and_metadata`，设置 RUN_WEEK8_DAY4=1 时启用。
+
+- **数据来源**：带 BOM/CRLF、scope 和标题路径的 KnowledgeDocument。
+- **流程**：执行 to_document，然后修改返回对象。
+- **检查点**：id、page_content、metadata 对应正确；Loader 阶段未清洗；深拷贝隔离输入。
+- **输出**：pytest 结果，无文件。
+
+### 测试六（Day4）：Manifest Loader 只加载正文
+
+函数：`test_manifest_loader_keeps_order_and_json_body_boundaries`，设置 RUN_WEEK8_DAY4=1 时启用。
+
+- **数据来源**：临时 MD/TXT/JSON 小语料，顺序故意与文件名排序不同，包含非知识说明。
+- **流程**：分别使用继承的 load 和实现的 lazy_load。
+- **检查点**：顺序正确；三文件产生四正文单元；JSONPath 和标题路径保留；README/notice 未进入正文，源文件不变。
+- **输出**：pytest 结果，无文件。
+
+### 测试七（Day4）：源文件异常不能静默跳过
+
+函数：`test_loader_propagates_bad_source_errors`，设置 RUN_WEEK8_DAY4=1 时启用，三组。
+
+- **数据来源**：在临时语料副本中删除文件、写入非法 UTF-8 或非法 JSON。
+- **流程**：ManifestLoader 尝试读取。
+- **检查点**：分别保留 FileNotFoundError、UnicodeDecodeError、JSONDecodeError，不伪造完整加载结果。
+- **输出**：pytest 结果；仅修改测试临时数据。
+
+### 测试八（Day4）：字符窗口与精确重叠
+
+函数：`test_aligned_splitter_uses_character_windows_and_exact_overlap`，设置 RUN_WEEK8_DAY4=1 时启用。
+
+- **数据来源**：15 个可区分的中文字符，max_chars=6、overlap=2。
+- **流程**：创建 Splitter，调用其 create_documents。
+- **检查点**：四块正文对应已知窗口，start_index 正确，相邻块重叠 2 字符；按字符而非 UTF-8 字节计算。
+- **输出**：pytest 结果，无文件。
+
+### 测试九（Day4）：标题、代码围栏和来源回溯
+
+函数：`test_chunks_keep_titles_code_fences_and_exact_source_locations`，设置 RUN_WEEK8_DAY4=1 时启用。
+
+- **数据来源**：同一合成小语料，含围栏中的伪标题与多段 JSON 正文。
+- **流程**：Loader → split_documents；与 Week7 原路径独立生成的结果对照。
+- **检查点**：切点、ID、完整元数据一致；代码内的 # 不是标题；每块能回溯正文，非空白字符无遗漏，输入及其他块的元数据不受修改影响。
+- **输出**：pytest 结果，无文件。
+
+### 测试十（Day4）：递归分隔如何改变切点
+
+函数：`test_recursive_separator_mode_changes_cuts_and_keeps_coverage`，设置 RUN_WEEK8_DAY4=1 时启用。
+
+- **数据来源**：中文长段落合成文本，段间有双换行。
+- **流程**：同一文本分别使用 aligned/recursive 分块。
+- **检查点**：两模式切点不同，但最大长度、正文覆盖和位置回溯有效；递归模式的实际重叠不超过目标上限。
+- **输出**：pytest 结果，无文件，不用完整语料强造差异。
+
+### 测试十一（Day4）：两种 Embedding 入口和数组形状
+
+函数：`test_embeddings_adapter_uses_correct_entry_and_array_shape`，设置 RUN_WEEK8_DAY4=1 时启用，两组入口。
+
+- **数据来源**：FixedEncoder 的人工向量以及含空格的正文/问题。
+- **流程**：调用 embed_documents/embed_query，记录底层入口及实参。
+- **检查点**：批量正文保持二维顺序；单问题返回一维向量；不修改原文，空文档批次不请求编码器。
+- **输出**：pytest 结果，无文件。
+
+### 测试十二（Day4）：Qwen 查询前缀与 HTTP Mock
+
+函数：`test_adapter_preserves_qwen_query_prefix_on_mock_http`，设置 RUN_WEEK8_DAY4=1 时启用。
+
+- **数据来源**：原 OllamaEncoder 接口、固定正文/问题和 MockTransport 响应。
+- **流程**：通过 LangChain 适配器调用两个编码入口，记录实际 /api/embed 请求正文。
+- **检查点**：文档原样编码；查询仍有原 Qwen Instruct/Query 前缀；同一模型，truncate=false。
+- **输出**：pytest 结果；全部 HTTP 在本地 Mock，不访问 Ollama。
+
+### 测试十三（Day4）：非法向量不能流入后续流程
+
+函数：`test_embeddings_reject_invalid_model_vectors`，设置 RUN_WEEK8_DAY4=1 时启用，六组。
+
+- **数据来源**：空/条数不符、零向量、bool、NaN 和混合维数的人工返回。
+- **流程**：经适配器调用已有 embed_texts 的校验。
+- **检查点**：明确抛 ValueError，不以错误向量生成成功结果。
+- **输出**：pytest 结果，无文件。
+
+### 测试十四（Day4）：模型异常与空白问题
+
+函数：`test_embeddings_preserve_model_errors_and_reject_blank_query`，设置 RUN_WEEK8_DAY4=1 时启用。
+
+- **数据来源**：会抛 RuntimeError 的假编码器，以及纯空白问题。
+- **流程**：调用正文/问题入口。
+- **检查点**：模型异常原样向外传播；空白问题在请求编码器前拒绝。
+- **输出**：pytest 结果，无文件。
+
+### 测试十五（Day4）：完整小流程和向量绑定
+
+函数：`test_small_preparation_saves_comparison_and_bound_vectors`，设置 RUN_WEEK8_DAY4=1 时启用。
+
+- **数据来源**：合成小语料、FixedEncoder 人工向量。
+- **流程**：run_preparation 完成两版预处理对照与两种编码，写出 JSON。
+- **检查点**：same_chunks=true；正文/问题入口各调用一次；向量按原序绑定 chunk_id，报告与文件一致，源文件哈希不变。
+- **输出**：pytest 临时目录 artifacts 下的六个 JSON 文件，向量模式标为 offline_fixture。
+
+### 测试十六（Day4）：完整 Week7 知识集对照
+
+函数：`test_week7_corpus_comparison_preserves_same_sources`，设置 RUN_WEEK8_DAY4=1 时启用，两种模式。
+
+- **数据来源**：原 Week7 的 18 份文件，不使用临时副本替换知识集。
+- **流程**：分别运行 aligned/recursive 的加载、清洗、分节、分块和对照，不编码。
+- **检查点**：18 文件、20 正文单元、Week7 基准 64 块；aligned 必须完全一致；两模式的来源、版本、scope、JSONPath 和覆盖都有效，源文件哈希不变。
+- **输出**：artifacts/day4/aligned/、recursive/ 下的四个预处理 JSON；终端打印 same_chunks。
+
+### 测试十七（Day4）：真实本地 Embedding 对照
+
+函数：`test_local_ollama_embeddings_match_week7_backend`，额外开启 MODEL 才执行。
+
+- **数据来源**：同一 64 块和固定问题、已安装的真实 Qwen3 Embedding。
+- **流程**：LangChain 接口编码文档与问题；额外经 Week7 入口编码第一块做数值对照。
+- **检查点**：分块仍对齐，向量维数有效且问题/正文一致，第一块向量在容差内一致；不把 shape 检查当成检索效果评估。
+- **输出**：artifacts/day4/local_model/ 下的六个 JSON 文件。
+
+### Day4 完成标准
+
+本日已通过完整离线测试和显式本地 Embedding 测试。
+能拿 documents.json、chunks.json 和 comparison_report.json 说明 Document/Chunk 的差别、来源怎样保留、重叠在哪里，以及框架接口和底层模型分别负责什么。
+
+官方资料：[Document 与知识准备](https://docs.langchain.com/oss/python/langchain/knowledge-base)、[LangChain Core 接口](https://reference.langchain.com/python/langchain-core/)、[Text Splitters 接口](https://reference.langchain.com/python/langchain-text-splitters/)。
