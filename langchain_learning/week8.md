@@ -1,10 +1,10 @@
 # Week8：LangChain 学习
 
 > 基准计划：`/home/xumaozhou/Music/agent_engineer_learning_plan_v4_mcp.md`。
-> 当前进度（2026-11-11）：**Day1～Day4 已完成；下一阶段为 Day5：Vector Store、Retriever 与 RAG 重构**。
-> Week8 使用独立环境；知识库代码放在 `rag/`，关联测试放在 `tests/`。主项目的 Agents SDK 和 Week7 既有实现保持原样。
+> 当前进度（2026-11-12）：**Day1～Day5 已完成，下一步 Day6：LangChain 与 Agents SDK 的集成边界**。
+> 默认使用主项目 `.venv`；知识库代码放在 `rag/`，关联测试放在 `tests/`。主项目的 Agents SDK 和 Week7 既有实现保持原样。
 
-工具学习见 [Day3 章节](#day3)；Day4 完成记录、代码入口和逐项测试见 [Day4 章节](#day4)。
+文档准备的完成记录见 [Day4 章节](#day4)；向量库、检索链与逐项验收记录见 [Day5 章节](#day5)。
 
 ## Day1 完成记录
 
@@ -123,20 +123,19 @@ history 是调用方显式提供的记录；模型实例不会自动把之前的
 
 ## 环境与数据来源
 
-### 独立 Python 环境
+### Python 环境
 
-本次已创建并安装：`langchain_learning/.venv`，使用 Python 3.10。
-主项目 `.venv` 未安装或升级 LangChain。以后重建独立环境时执行：
+Day1～Day4 最初使用 `langchain_learning/.venv`。从 Day5 收尾起，按用户要求统一使用主项目 `.venv`（Python 3.10）。
+当前主项目环境已安装本周依赖；需要重新安装时，在仓库根目录执行：
 
 ```bash
-.venv/bin/python -m venv langchain_learning/.venv
-langchain_learning/.venv/bin/python -m pip install -r langchain_learning/requirements.txt
+.venv/bin/python -m pip install -r langchain_learning/requirements.txt
 ```
 
 已固定 `langchain-core==1.7.6`、`langchain-openai==1.7.4` 以及本次 pytest 版本。
 其余为解析得到的传递依赖；requirements.txt 不是包含所有平台依赖的完整锁文件。
-IDE 中运行本日测试时，应选择 `langchain_learning/.venv/bin/python`。
-若误用未安装 LangChain 的主环境，本组测试会整体跳过，并提示正确环境。
+IDE 中运行测试时，选择主项目 `.venv/bin/python`。
+未安装 LangChain 等依赖时，测试可能因 importorskip 跳过；跳过不表示验收通过。
 
 ### 测试数据来源
 
@@ -158,7 +157,7 @@ IDE 中运行本日测试时，应选择 `langchain_learning/.venv/bin/python`�
 
 ```bash
 RUN_WEEK8_DAY1=0 RUN_WEEK8_DAY1_LLM=0 \
-langchain_learning/.venv/bin/python -B -m pytest tests/test_week8_day1.py \
+.venv/bin/python -B -m pytest tests/test_week8_day1.py \
 -q -s -p no:cacheprovider
 ```
 
@@ -169,7 +168,7 @@ langchain_learning/.venv/bin/python -B -m pytest tests/test_week8_day1.py \
 
 ```bash
 RUN_WEEK8_DAY1=1 RUN_WEEK8_DAY1_LLM=0 \
-langchain_learning/.venv/bin/python -B -m pytest tests/test_week8_day1.py \
+.venv/bin/python -B -m pytest tests/test_week8_day1.py \
 -q -s -p no:cacheprovider
 ```
 
@@ -182,7 +181,7 @@ langchain_learning/.venv/bin/python -B -m pytest tests/test_week8_day1.py \
 
 ```bash
 RUN_WEEK8_DAY1=1 RUN_WEEK8_DAY1_LLM=1 \
-langchain_learning/.venv/bin/python -B -m pytest \
+.venv/bin/python -B -m pytest \
 tests/test_week8_day1.py::test_real_model_messages_and_leading_zero \
 -v -s -p no:cacheprovider
 ```
@@ -193,7 +192,7 @@ tests/test_week8_day1.py::test_real_model_messages_and_leading_zero \
 也可使用已提供的 CLI，手动观察一次不带历史的调用：
 
 ```bash
-langchain_learning/.venv/bin/python -B -m langchain_learning.day1 --real-llm \
+.venv/bin/python -B -m langchain_learning.day1 --real-llm \
   --question '字符串任务标识 00123 为什么不应该转成整数？'
 ```
 
@@ -207,7 +206,7 @@ CLI 的规则使用 DEFAULT_INSTRUCTIONS；history 的传入由真实 pytest 展
 | `langchain_learning/artifacts/day1/real_model/report.json` | 显式真实 pytest 或 CLI 的实际返回 |
 
 pytest 可使用 `WEEK8_DAY1_OUTPUT` 修改产物根目录，CLI 使用 `--output`。
-同名报告只在成功后覆盖；失败时旧文件可能仍在，不能据此认定本次成功。产物及独立环境均已 Git 忽略。
+同名报告只在成功后覆盖；失败时旧文件可能仍在，不能据此认定本次成功。产物及虚拟环境均已 Git 忽略。
 
 ## 测试一：SDK 消息对照保留角色和原文
 
@@ -339,7 +338,7 @@ pytest 可使用 `WEEK8_DAY1_OUTPUT` 修改产物根目录，CLI 使用 `--outpu
 ## Day2：Prompt Template、Runnable 与 Parser
 
 实现：[day2.py](day2.py)。测试：[test_week8_day2.py](../tests/test_week8_day2.py)。
-沿用 Day1 独立环境和 build_model，不新增依赖、不下载模型。三个关键步骤及本日验收均已完成。
+沿用 Day1 的 build_model；当前默认环境为主项目 `.venv`。本日不新增依赖、不下载模型，三个关键步骤及验收均已完成。
 
 ### Day2 完成记录
 
@@ -501,7 +500,7 @@ pytest 可用 WEEK8_DAY2_OUTPUT 修改产物根目录，CLI 用 --output。
 
 ```bash
 RUN_WEEK8_DAY2=0 RUN_WEEK8_DAY2_LLM=0 \
-langchain_learning/.venv/bin/python -B -m pytest tests/test_week8_day2.py \
+.venv/bin/python -B -m pytest tests/test_week8_day2.py \
 -q -s -p no:cacheprovider
 ```
 
@@ -511,7 +510,7 @@ langchain_learning/.venv/bin/python -B -m pytest tests/test_week8_day2.py \
 
 ```bash
 RUN_WEEK8_DAY2=1 RUN_WEEK8_DAY2_LLM=0 \
-langchain_learning/.venv/bin/python -B -m pytest tests/test_week8_day2.py \
+.venv/bin/python -B -m pytest tests/test_week8_day2.py \
 -q -s -p no:cacheprovider
 ```
 
@@ -524,7 +523,7 @@ langchain_learning/.venv/bin/python -B -m pytest tests/test_week8_day2.py \
 
 ```bash
 RUN_WEEK8_DAY2=1 RUN_WEEK8_DAY2_LLM=1 \
-langchain_learning/.venv/bin/python -B -m pytest \
+.venv/bin/python -B -m pytest \
 tests/test_week8_day2.py::test_real_prompt_model_parser \
 -v -s -p no:cacheprovider
 ```
@@ -535,7 +534,7 @@ tests/test_week8_day2.py::test_real_prompt_model_parser \
 也可执行一个固定证据的 CLI 演示：
 
 ```bash
-langchain_learning/.venv/bin/python -B -m langchain_learning.day2 --real-llm \
+.venv/bin/python -B -m langchain_learning.day2 --real-llm \
   --question 'NOT_FOUND 是不是表示任务执行失败？'
 ```
 
@@ -724,10 +723,10 @@ langchain_learning/.venv/bin/python -B -m langchain_learning.day2 --real-llm \
 
 `requirements.txt` 已补充 `langchain==1.4.9`，用于 `create_agent`；保留既有 core/openai 版本。
 另固定 `mcp==2.1.1`，原因是复用的 `week6.py` 在模块顶部导入 MCP 类型；本日不启动 MCP Server 或子进程。
-本轮已安装到 Week8 独立环境，主项目 `.venv` 不变。以后重建环境仍执行：
+Day3 最初安装到独立环境；当前已统一使用主项目 `.venv`。需要重新安装时执行：
 
 ```bash
-langchain_learning/.venv/bin/python -m pip install -r langchain_learning/requirements.txt
+.venv/bin/python -m pip install -r langchain_learning/requirements.txt
 ```
 
 | 代码 | 本日职责 |
@@ -808,13 +807,13 @@ ScriptedModel 基于 LangChain GenericFakeChatModel，补充 Agent 需要的 bin
 
 ### 命令、报告与检查顺序
 
-以下命令均在仓库根目录执行，使用 `langchain_learning/.venv/bin/python`。
+以下命令均在仓库根目录执行，使用 `.venv/bin/python`。
 
 **第一步：基础部分的独立自检。**
 
 ```bash
 RUN_WEEK8_DAY3=0 RUN_WEEK8_DAY3_LLM=0 \
-langchain_learning/.venv/bin/python -B -m pytest tests/test_week8_day3.py \
+.venv/bin/python -B -m pytest tests/test_week8_day3.py \
 -q -s -p no:cacheprovider
 ```
 
@@ -825,7 +824,7 @@ langchain_learning/.venv/bin/python -B -m pytest tests/test_week8_day3.py \
 
 ```bash
 RUN_WEEK8_DAY3=1 RUN_WEEK8_DAY3_LLM=0 \
-langchain_learning/.venv/bin/python -B -m pytest tests/test_week8_day3.py \
+.venv/bin/python -B -m pytest tests/test_week8_day3.py \
 -q -s -p no:cacheprovider
 ```
 
@@ -835,7 +834,7 @@ langchain_learning/.venv/bin/python -B -m pytest tests/test_week8_day3.py \
 
 ```bash
 RUN_WEEK8_DAY3=1 RUN_WEEK8_DAY3_LLM=1 \
-langchain_learning/.venv/bin/python -B -m pytest \
+.venv/bin/python -B -m pytest \
 tests/test_week8_day3.py::test_real_agent_selects_tool_and_preserves_arguments \
 -v -s -p no:cacheprovider
 ```
@@ -847,7 +846,7 @@ tests/test_week8_day3.py::test_real_agent_selects_tool_and_preserves_arguments \
 也可独立运行一次真实模型 + Mock 业务演示：
 
 ```bash
-langchain_learning/.venv/bin/python -B -m langchain_learning.day3 --real-llm \
+.venv/bin/python -B -m langchain_learning.day3 --real-llm \
   --question '查询任务 12345 的状态，并说明来源。'
 ```
 
@@ -1062,12 +1061,12 @@ langchain_learning/.venv/bin/python -B -m langchain_learning.day3 --real-llm \
 | rag/embeddings.py | 复用既有 OllamaEncoder、query 前缀及向量校验，不重新实现 HTTP |
 | tests/test_week8_day4.py | 提供合成文件、人工向量、Mock HTTP、断言及真实本地模型开关 |
 
-新增依赖只有 `langchain-text-splitters==1.1.3`，已检查与既有 core 版本兼容并安装到独立环境。
+Day4 新增依赖只有 `langchain-text-splitters==1.1.3`，已检查与既有 core 版本兼容；当前主项目环境也已安装。
 新增依赖后的 Day1～Day3 完整离线回归：98 passed、7 skipped；七项真实模型用例均未启用。
 以后重新安装使用：
 
 ```bash
-langchain_learning/.venv/bin/python -m pip install -r langchain_learning/requirements.txt
+.venv/bin/python -m pip install -r langchain_learning/requirements.txt
 ```
 
 本日不安装 langchain-community 或另一套 Ollama 适配包：ManifestLoader 遵循 BaseLoader 接口，读取规则由现有清单决定；Week7Embeddings 遵循 Embeddings 接口，后端仍是已有模型。
@@ -1164,7 +1163,7 @@ embed_query(一个问题)          → [问题向量...]
 
 ```bash
 RUN_WEEK8_DAY4=0 RUN_WEEK8_DAY4_MODEL=0 \
-langchain_learning/.venv/bin/python -B -m pytest tests/test_week8_day4.py \
+.venv/bin/python -B -m pytest tests/test_week8_day4.py \
 -q -s -p no:cacheprovider
 ```
 
@@ -1174,7 +1173,7 @@ langchain_learning/.venv/bin/python -B -m pytest tests/test_week8_day4.py \
 
 ```bash
 RUN_WEEK8_DAY4=1 RUN_WEEK8_DAY4_MODEL=0 \
-langchain_learning/.venv/bin/python -B -m pytest tests/test_week8_day4.py \
+.venv/bin/python -B -m pytest tests/test_week8_day4.py \
 -q -s -p no:cacheprovider
 ```
 
@@ -1184,7 +1183,7 @@ langchain_learning/.venv/bin/python -B -m pytest tests/test_week8_day4.py \
 也可以只做加载、分块和对照，直接查看输出文件：
 
 ```bash
-langchain_learning/.venv/bin/python -B -m rag.langchain_preparation \
+.venv/bin/python -B -m rag.langchain_preparation \
   --output langchain_learning/artifacts/day4/preprocess
 ```
 
@@ -1194,7 +1193,7 @@ langchain_learning/.venv/bin/python -B -m rag.langchain_preparation \
 
 ```bash
 RUN_WEEK8_DAY4=1 RUN_WEEK8_DAY4_MODEL=1 \
-langchain_learning/.venv/bin/python -B -m pytest \
+.venv/bin/python -B -m pytest \
 tests/test_week8_day4.py::test_local_ollama_embeddings_match_week7_backend \
 -v -s -p no:cacheprovider
 ```
@@ -1381,3 +1380,306 @@ pytest 可以通过 WEEK8_DAY4_OUTPUT 改根目录，CLI 使用 --output。
 能拿 documents.json、chunks.json 和 comparison_report.json 说明 Document/Chunk 的差别、来源怎样保留、重叠在哪里，以及框架接口和底层模型分别负责什么。
 
 官方资料：[Document 与知识准备](https://docs.langchain.com/oss/python/langchain/knowledge-base)、[LangChain Core 接口](https://reference.langchain.com/python/langchain-core/)、[Text Splitters 接口](https://reference.langchain.com/python/langchain-text-splitters/)。
+
+<a id="day5"></a>
+
+## Day5：Vector Store、Retriever 与 RAG 重构（已完成）
+
+代码：[rag/langchain_rag.py](../rag/langchain_rag.py)。测试：[test_week8_day5.py](../tests/test_week8_day5.py)。
+三个关键连接点已完成，离线测试、真实 Ollama 检索及两项 DeepSeek 回答均已通过。
+
+### Day5 完成记录（2026-11-12）
+
+- 已实现批量入库、精确过滤的 Retriever，以及保留原问题的 Runnable 回答链。
+- 完整离线验收：39 passed、3 skipped；跳过项为显式真实模型测试。
+- 用户已运行真实 Ollama 的 15 题检索；助手复核报告：13 题有预期文档组，召回率均为 100%；另 2 题不适用召回率。所有版本检查通过，排序与 Week7 一致。
+- 两项真实回答均正常完成：NOT_FOUND 的四条结论均有对应证据支持；实时状态问题返回 insufficient，明确缺少实时 API 结果，没有编造当前状态。
+- 实际消息包含报告中的 Context，引用摘录与原文一致，来源均为 current、版本 2.0。真实索引为 64 个 Chunk、1024 维向量，回答测试复用了已保存的索引。
+- 默认环境已统一为主项目 `.venv`；运行产物和虚拟环境不提交。本次收尾只重跑离线测试，真实结果来自用户运行及本地报告复核。
+
+### 学习与验收目标
+
+| 内容 | 验收时能展示的行为 |
+|---|---|
+| Vector Store | 把 Day4 Chunk Document 批量入库，保留 ID、正文及来源；区分建库和查询 |
+| JSON 缓存 | 保存/加载后继续查询，加载不重新编码正文；模型、查询前缀和维数不能混用 |
+| Retriever | 按问题检索，先精确过滤再 Top-K，返回保留来源、版本和分数的 Document |
+| Runnable 链 | 保留原问题，执行检索，组装 Context，再调用已有回答层 |
+| 引用与边界 | 引用能回到 source/version/原文；无证据跳过生成，静态文档不能冒充实时状态 |
+| Week7 对照 | 原有 15 个问题仍可进入检索，使用相同向量时与原实现对照；真实检索与真实回答分开验证 |
+
+本日采用 core 自带的 InMemoryVectorStore，小语料逐个计算余弦相似度，不增加数据库服务或 ANN 索引。
+本日没有把检索工具集成到主项目 Agent；LangChain 与 Agents SDK 的集成是 Day6 内容。
+
+### 文件与数据来源
+
+| 文件/数据 | 用途 |
+|---|---|
+| rag/langchain_preparation.py | 直接复用 Day4 Loader、分块和 Week7Embeddings，默认仍为同一 64 块 |
+| rag/langchain_rag.py | 向量库建库/缓存、Retriever、旧结果格式适配、Runnable 链与报告 |
+| rag/answering.py | 沿用 Week7 的 Context 预算、RagAnswer、逐字摘录校验和 DeepSeekGenerator |
+| rag/eval_cases_day6.json | 原有 15 个固定问题和过滤条件；参考要点只在测试侧使用，不传给模型 |
+| tests/test_week8_day5.py | 合成小语料、人工向量、假生成器、断言和三个真实测试场景 |
+| Week7 manifest.json | 原 18 份知识文件、20 正文单元；不扫描参考答案或 README |
+
+Day5 新增 `numpy==2.2.6`，供 InMemoryVectorStore 计算余弦；当前主项目环境已安装。
+准备 Day5 时，原独立环境中的 Day1～Day4 完整离线回归为 133 passed、8 skipped，全部真实模型用例未启用。
+重建环境时仍执行：
+
+```bash
+.venv/bin/python -m pip install -r langchain_learning/requirements.txt
+```
+
+模型沿用本地 qwen3-embedding:0.6b 和既有 DeepSeek 配置。真实验收已完成；不请求业务 API。
+代码只新增在 `rag/`；Week7 已有实现和主项目 Agent 保持原样。
+
+### 已完成的三个学习点
+
+| 标识/函数 | 输入 | 已完成的关键动作 | 输出 |
+|---|---|---|---|
+| W8D5-1，build_store | owned：已深拷贝的 Chunk Document 列表；store 已创建 | 调用 store.add_documents，使用 documents 参数传 owned | 库内保存正文向量、原 ID 与元数据；该动作在建库时编码正文 |
+| W8D5-2，KnowledgeRetriever._get_relevant_documents | query、self.k、已提供的 predicate | 调用 self.store.similarity_search_with_score，传问题、k 和 filter | pairs 为 [(Document, float), ...]；后续分数/副本处理已提供 |
+| W8D5-3，build_rag_chain | retriever、documents_to_hits、answer_step | 用 RunnableParallel 保留 question 并检索 hits，再通过管道接回答步骤 | 输入字符串，await chain.ainvoke 后返回回答及引用报告 |
+
+原三处填空现已完成，源码中保留学习点说明。创建 InMemoryVectorStore 和组装链本身不调用模型；build_store 的入库步骤编码正文，链执行时编码问题并按证据情况调用生成模型。
+RunnableParallel、RunnablePassthrough、RunnableLambda、InMemoryVectorStore 均已在源码顶部导入。
+函数 docstring 写有实参名、输入输出及完整管道组成；文件保存、旧格式转换、Context 和引用校验无需重写。
+generate 是调用方传入的异步可调用对象，不是新增填空：离线 EvidenceGenerator 已在测试中定义，真实 DeepSeekGenerator 沿用 Week7。
+它接收两条消息 list[dict]、返回 JSON 字符串；链会把这份结果交给已有 RagAnswer 和引用校验处理。
+
+### 流程图与调用边界
+
+```mermaid
+flowchart TB
+    documents["Day4 的 Chunk Document"] --> build["首次入库：批量编码正文"]
+    build --> store["InMemoryVectorStore"]
+    store --> save["保存向量 JSON + 编码配置 JSON"]
+    save --> load["后续加载缓存，不重新编码正文"]
+    load --> retriever["KnowledgeRetriever"]
+    question["本轮问题"] --> branch["RunnableParallel：同一输入进入两条分支"]
+    branch --> preserve["保留 question 原文"]
+    branch --> retriever
+    retriever --> filter["精确过滤候选"]
+    filter -->|"有候选"| search["只编码问题，带分数 Top-K"]
+    filter -->|"无候选"| empty["空 hits，不编码问题"]
+    search --> hits["Document 适配为 Week7 hits"]
+    empty --> hits
+    hits --> context["沿用 build_context：去重和字符预算"]
+    preserve --> answer["沿用 answer_from_context"]
+    context --> answer
+    answer -->|"有可用证据"| generation["既有生成器返回 JSON，程序校验引用"]
+    answer -->|"证据为空"| insufficient["程序返回 insufficient，跳过生成"]
+    generation --> report["报告保留来源、版本、引用及模型原文"]
+    insufficient --> report
+```
+
+建库阶段编码正文；查询阶段只编码问题。若首次尚未建库，prepare_store 仍需先完成入库；“无候选不编码”指之后的查询阶段。
+过滤条件由调用方或测试用例明确提供，支持 engine_code/knowledge_status/version 精确匹配，条件之间为 AND；不让模型自行猜测版本过滤。
+
+普通 `store.as_retriever()` 返回 Document 时不附带分数。本例提供 KnowledgeRetriever，继承 BaseRetriever，调用带分数接口并将真实分数放入 metadata.retrieval_score。
+该临时字段只写到结果副本，随后适配为 Week7 的 `{score, chunk}`；库内元数据和原文不被修改。
+当前内存库的分数是余弦相似度，越高越相似；其他向量库可能返回距离，不能直接套用相同含义。
+
+### 缓存和报告怎样阅读
+
+| 文件 | 作用 |
+|---|---|
+| knowledge_store.json | LangChain dump 的 ID、正文、元数据和向量，重排为中文可读 JSON |
+| knowledge_store.config.json | schema_version、模型名、query_instruction、embedding_mode、条数和维数 |
+| offline/retrieval_comparison.json | 15 题的人工向量对照：问题、过滤条件、命中 ID、来源和版本 |
+| local_model/retrieval_report.json | 真实本地 15 题检索结果、文档组召回、版本检查及同分顺序信息 |
+| real_model/grounded_report.json | 真实有依据回答、实际 Context、原文摘录与解析后的来源 |
+| real_model/realtime_report.json | 真实实时问题拒答及其依据范围 |
+
+固定根目录为 `langchain_learning/artifacts/day5/`；两个库文件放在对应测试目录，真实测试共用 local_model/ 下的库。
+pytest 可用 WEEK8_DAY5_OUTPUT 改产物根目录，CLI 可用 --store/--output；产物和虚拟环境不提交。
+
+模型名、查询前缀或 artificial/local 模式不一致时，加载明确失败，不能只因维数相同就复用。
+源文档变化后须显式 rebuild=True 或 CLI --rebuild；当前没有自动检测知识更新，也不在加载失败后悄悄重建。
+两个库文件需要一起保存，本练习不实现多文件事务。
+
+### 测试顺序与命令
+
+以下命令在仓库根目录执行。
+
+**1. 填写前检查已提供部分。**
+
+```bash
+RUN_WEEK8_DAY5=0 RUN_WEEK8_DAY5_MODEL=0 RUN_WEEK8_DAY5_LLM=0 \
+.venv/bin/python -B -m pytest tests/test_week8_day5.py \
+-q -s -p no:cacheprovider
+```
+
+框架自检：15 passed、27 skipped。跳过完整流程 24 项及真实推理 3 项。
+
+**2. 填完后运行完整离线测试。**
+
+```bash
+RUN_WEEK8_DAY5=1 RUN_WEEK8_DAY5_MODEL=0 RUN_WEEK8_DAY5_LLM=0 \
+.venv/bin/python -B -m pytest tests/test_week8_day5.py \
+-q -s -p no:cacheprovider
+```
+
+当前仓库实现已通过完整离线验证：39 passed、3 skipped；三项真实模型测试保持关闭。
+普通测试的人工向量/假生成器没有语义推理能力。沙箱存在异步线程限制时，在正常本地终端执行，不为环境问题改写 Runnable。
+
+**3. 显式运行真实 Ollama 的 15 题检索，不调用 DeepSeek。**
+
+```bash
+RUN_WEEK8_DAY5=1 RUN_WEEK8_DAY5_MODEL=1 RUN_WEEK8_DAY5_LLM=0 \
+.venv/bin/python -B -m pytest \
+tests/test_week8_day5.py::test_local_ollama_retrieval_on_fifteen_questions \
+-v -s -p no:cacheprovider
+```
+
+需要已启动的 Ollama 和已拉取的 qwen3-embedding:0.6b。首次建库编码 64 块，后续加载不重复编码正文。
+每题使用本次问题向量和同一库的向量与 Week7 对照，不为了对照再次请求同一个问题向量。
+沿用每题过滤条件，默认 K=5；W7D6-08 沿用已验证的 K=10。
+同分结果可能在两实现间换序，测试允许分数容差内的同分差异，报告保留 same_ranked_ids 供查看。
+
+**4. 显式运行两项真实 RAG 回答。**
+
+```bash
+RUN_WEEK8_DAY5=1 RUN_WEEK8_DAY5_MODEL=1 RUN_WEEK8_DAY5_LLM=1 \
+.venv/bin/python -B -m pytest \
+tests/test_week8_day5.py::test_real_rag_answers_use_existing_generation_layer \
+-v -s -p no:cacheprovider
+```
+
+需要既有 DeepSeek OPENAI_API_KEY；模型调用仍由 Week7 DeepSeekGenerator 处理，不读取或记录密钥。
+两题分别解释 NOT_FOUND 和询问任务 12345 当前状态；自动检查 answered/insufficient、引用原文和来源版本后，还需阅读回答是否受证据支持。
+用户已运行第 3、4 步，助手已复核检索报告、实际回答及对应证据。本次收尾不重复调用真实模型；15 题检索和两题回答分别验收，不把检索通过描述为 15 条生成回答全部通过。
+
+可选 CLI：完成填空和离线验收后，执行一次 Ollama + DeepSeek 演示：
+
+```bash
+.venv/bin/python -B -m rag.langchain_rag --real-llm \
+  --question 'NOT_FOUND 是不是表示任务执行失败？'
+```
+
+CLI 默认过滤 knowledge_status=current，支持 --engine-code、--version、--k；这些条件属于程序配置。
+
+### 测试一（Day5）：非法 Chunk 在编码前拒绝
+
+函数：`test_provided_invalid_chunks_are_rejected_before_embedding`，默认执行，三组。
+
+- **数据来源**：合成 Chunk 列表，注入重复 ID、缺 source 或查询临时分数。
+- **流程**：调用 build_store 的前置校验。
+- **检查点**：抛 ValueError，编码器未被调用；不能自动生成新 ID 掩盖来源问题。
+- **输出**：pytest 结果，无文件。
+
+### 测试二（Day5）：保存/加载不重新编码
+
+函数：`test_provided_persistence_roundtrip_never_embeds`，默认执行。
+
+- **数据来源**：测试直接构造的 LangChain 人工向量库，避免依赖学生填空。
+- **流程**：save_store → 两个 JSON → load_store。
+- **检查点**：恢复后的正文、元数据和向量一致，模型零调用，文件正文可读。
+- **输出**：pytest 临时目录 knowledge_store.json 和 knowledge_store.config.json。
+
+### 测试三（Day5）：不兼容或损坏的缓存
+
+函数：`test_provided_incompatible_or_corrupt_cache_is_rejected`，默认执行，六组。
+
+- **数据来源**：临时库副本，修改模型、查询前缀、向量模式、维数、向量或版本。
+- **流程**：尝试加载，不重建。
+- **检查点**：明确抛 ValueError，模型零调用；人工向量不能作为本地真实模型缓存。
+- **输出**：pytest 临时 JSON，无固定报告。
+
+### 测试四（Day5）：检索配置校验
+
+函数：`test_provided_retrieval_config_validation_has_no_model_calls`，默认执行，五组。
+
+- **数据来源**：非法 K、未知过滤字段、空版本和超范围分数阈值。
+- **流程**：构造 Retriever。
+- **检查点**：校验先于问题编码，不触发模型。
+- **输出**：pytest 结果，无文件。
+
+### 测试五（Day5）：批量入库及元数据隔离
+
+函数：`test_build_store_encodes_once_and_owns_metadata`，设置 RUN_WEEK8_DAY5=1 启用。
+
+- **数据来源**：四条不同流程/版本的合成 Chunk、人工编码器。
+- **流程**：执行你填写的入库操作，再修改原输入元数据。
+- **检查点**：正文只批量编码一次，ID 原样保留，原输入与库相互隔离。
+- **输出**：pytest 结果，无文件。
+
+### 测试六（Day5）：先过滤再 Top-K，只编码问题
+
+函数：`test_retriever_prefilters_exact_metadata_and_only_encodes_query`，设置 RUN_WEEK8_DAY5=1 启用。
+
+- **数据来源**：人工向量刻意让历史版和相似流程排得更靠前，目标只有 current/import_std。
+- **流程**：Retriever 执行带过滤的带分数查询，再转换为 Week7 hits。
+- **检查点**：仍召回目标而非先取 K 后过滤为空；只编码问题一次，分数为真实余弦值；来源/版本保留，库内元数据不变。
+- **输出**：pytest 结果，无文件。
+
+### 测试七（Day5）：Runnable 与旧回答层连接
+
+函数：`test_rag_chain_keeps_question_context_and_resolved_citations`，设置 RUN_WEEK8_DAY5=1 启用。
+
+- **数据来源**：人工向量库；假生成器从本次 Context 生成带原文摘录的固定回答。
+- **流程**：同一问题进入保留/检索分支 → Context → 原回答层 → 引用解析。
+- **检查点**：原问题不丢失；问题只编码一次、生成器只调用一次；规则与证据分开，引用解析到 GOOD 的 source/version。
+- **输出**：pytest 结果，无文件；不代表真实模型语义测试。
+
+### 测试八（Day5）：没有可用证据时跳过生成
+
+函数：`test_no_usable_evidence_skips_generation`，设置 RUN_WEEK8_DAY5=1 启用，三组。
+
+- **数据来源**：无匹配版本、Context 预算过小、相似度阈值过高。
+- **流程**：运行已有库的查询链。
+- **检查点**：统一 insufficient、无引用、生成零调用；无候选还应跳过问题编码，另两种情况允许一次问题编码。
+- **输出**：pytest 临时 empty.json。
+
+### 测试九（Day5）：坏回答不能伪装成信息不足
+
+函数：`test_invalid_answer_propagates_and_keeps_raw_output`，设置 RUN_WEEK8_DAY5=1 启用，两组。
+
+- **数据来源**：非法 JSON 和引用 S99 的假模型输出。
+- **流程**：回答层解析/引用校验失败，run_rag 保存错误后继续抛出。
+- **检查点**：执行状态 failed，保留真实原文和异常类型，不改成正常 insufficient。
+- **输出**：pytest 临时 failure.json。
+
+### 测试十（Day5）：缓存命中不读源文档、不编码正文
+
+函数：`test_prepare_store_reuses_cache_without_reading_sources_or_embedding`，设置 RUN_WEEK8_DAY5=1 启用。
+
+- **数据来源**：同一 Week7 完整知识集，第一次用人工向量建库。
+- **流程**：再次 prepare_store 时让 Loader 一经调用就失败。
+- **检查点**：第二次仍成功 loaded，缓存保持一致，模型零调用；无需重新读取源文档。
+- **输出**：pytest 临时 knowledge_store.json 及配置文件。
+
+### 测试十一（Day5）：原有 15 题离线检索对照
+
+函数：`test_fifteen_week7_questions_match_baseline_with_same_fixture_vectors`，设置 RUN_WEEK8_DAY5=1 启用，15 题。
+
+- **数据来源**：原 Week7 cases 文件、同一 64 块及人工三维向量。
+- **流程**：LangChain Retriever 与原 search_knowledge 使用同一批向量和过滤条件。
+- **检查点**：数量、分数、完整来源字段、版本过滤一致；同分允许换序；查询时没有正文编码。
+- **输出**：offline/retrieval_comparison.json，记录已完成题数及各题来源。这里只测实现对照，不使用预期文档组评语义召回。
+
+### 测试十二（Day5）：真实 Ollama 的 15 题检索
+
+函数：`test_local_ollama_retrieval_on_fifteen_questions`，额外开启 MODEL。
+
+- **数据来源**：同一知识集、实际 Qwen3 向量及原 15 题的预期文档组/版本。
+- **流程**：建立或加载真实库，逐题检索；重放本次问题向量做 Week7 对照。
+- **检查点**：两个实现检索分数及来源兼容，版本正确；有预期文档组的题目须全部召回，无预期组记为不适用。
+- **输出**：local_model/knowledge_store.json、配置文件及 retrieval_report.json；不调用 DeepSeek。
+
+### 测试十三（Day5）：真实带引用回答与实时拒答
+
+函数：`test_real_rag_answers_use_existing_generation_layer`，DAY5/MODEL/LLM 均启用，两题。
+
+- **数据来源**：真实 Qwen3 检索结果和既有 DeepSeek，不把评估参考项放入提示词。
+- **流程**：运行检索链、预算 Context、生成、JSON 结构与原文引用校验。
+- **检查点**：NOT_FOUND 得到 answered 和真实来源/版本；实时问题得到 insufficient、无伪造引用。
+- **输出**：real_model/grounded_report.json、realtime_report.json。仍需人工核对结论与证据是否对应，以及拒答理由是否正确。
+
+### Day5 完成标准与范围
+
+完成三个关键填空，通过离线测试、真实检索和两项真实回答，再阅读实际引用与拒答内容。
+能解释“何时编码正文/问题、Retriever 返回什么、过滤由谁提供、模型看到了哪些证据、引用如何保留来源和版本”，即达到本日目标。
+引用编号存在且摘录属于原文，只能证明结构和引用匹配，不能自动证明生成结论被充分支持。
+
+官方资料：[向量库与 Retriever](https://docs.langchain.com/oss/python/langchain/knowledge-base)、[LangChain Core 接口](https://reference.langchain.com/python/langchain-core/)。

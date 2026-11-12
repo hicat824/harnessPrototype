@@ -1,4 +1,4 @@
-# Week8 独立环境；Day1～Day4 共用，不修改主项目 .venv。
+# Week8 Day1～Day5 共用依赖；默认使用主项目 .venv。
 langchain-core==1.7.6
 langchain-openai==1.7.4
 # Day3 使用高层 Agent；mcp 是复用 week6.py 时的导入依赖，不启动 MCP 服务。
@@ -6,5 +6,7 @@ langchain==1.4.9
 mcp==2.1.1
 # Day4 只增加分块组件；Embedding 通过标准接口适配既有 OllamaEncoder。
 langchain-text-splitters==1.1.3
+# Day5 使用 core 自带 InMemoryVectorStore；其余弦计算需要 NumPy。
+numpy==2.2.6
 pytest==9.1.1
 pytest-asyncio==1.4.0

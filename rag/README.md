@@ -17,6 +17,8 @@ Week7 Day1～Day7 已完成，完整学习内容已汇总到 [week7.md](week7.md
 
 - [Day4：Document、Loader、Text Splitter 与 Embeddings（已完成）](../langchain_learning/week8.md#day4)
 - 实现：[langchain_preparation.py](langchain_preparation.py)，测试：[test_week8_day4.py](../tests/test_week8_day4.py)。
-- 沿用 Week7 同一知识集；实现放在 `rag/`，运行使用 Week8 独立环境。
+- 沿用 Week7 同一知识集；实现放在 `rag/`，默认使用主项目 `.venv`。
+- [Day5：Vector Store、Retriever 与检索回答链（已完成）](../langchain_learning/week8.md#day5)
+- Day5 实现：[langchain_rag.py](langchain_rag.py)，测试：[test_week8_day5.py](../tests/test_week8_day5.py)。
 
 本文件用于目录导航。Week7 学习内容与逐项测试维护在 `week7.md`，Week8 对应说明维护在 `langchain_learning/week8.md`。
