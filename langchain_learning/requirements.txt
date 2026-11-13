@@ -1,4 +1,4 @@
-# Week8 Day1～Day5 共用依赖；默认使用主项目 .venv。
+# Week8 Day1～Day6 共用依赖；默认使用主项目 .venv。
 langchain-core==1.7.6
 langchain-openai==1.7.4
 # Day3 使用高层 Agent；mcp 是复用 week6.py 时的导入依赖，不启动 MCP 服务。
@@ -8,5 +8,7 @@ mcp==2.1.1
 langchain-text-splitters==1.1.3
 # Day5 使用 core 自带 InMemoryVectorStore；其余弦计算需要 NumPy。
 numpy==2.2.6
+# Day6 复用主项目现有 Agents SDK，不需要另装 LangChain 集成包。
+openai-agents==0.22.2
 pytest==9.1.1
 pytest-asyncio==1.4.0

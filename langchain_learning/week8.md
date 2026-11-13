@@ -1,10 +1,10 @@
 # Week8：LangChain 学习
 
 > 基准计划：`/home/xumaozhou/Music/agent_engineer_learning_plan_v4_mcp.md`。
-> 当前进度（2026-11-12）：**Day1～Day5 已完成，下一步 Day6：LangChain 与 Agents SDK 的集成边界**。
+> 当前进度（2026-11-13）：**Day1～Day6 已完成，下一步 Day7：框架对比周验收**。
 > 默认使用主项目 `.venv`；知识库代码放在 `rag/`，关联测试放在 `tests/`。主项目的 Agents SDK 和 Week7 既有实现保持原样。
 
-文档准备的完成记录见 [Day4 章节](#day4)；向量库、检索链与逐项验收记录见 [Day5 章节](#day5)。
+向量库与检索链的完成记录见 [Day5 章节](#day5)；SDK 工具集成的实现与逐项验收见 [Day6 章节](#day6)。
 
 ## Day1 完成记录
 
@@ -1683,3 +1683,263 @@ CLI 默认过滤 knowledge_status=current，支持 --engine-code、--version、-
 引用编号存在且摘录属于原文，只能证明结构和引用匹配，不能自动证明生成结论被充分支持。
 
 官方资料：[向量库与 Retriever](https://docs.langchain.com/oss/python/langchain/knowledge-base)、[LangChain Core 接口](https://reference.langchain.com/python/langchain-core/)。
+
+<a id="day6"></a>
+
+## Day6：LangChain 与 Agents SDK 的集成边界（已完成）
+
+实现：[sdk_rag.py](../rag/sdk_rag.py)。测试：[test_week8_day6.py](../tests/test_week8_day6.py)。
+三个关键连接点已完成，完整离线验收及两项真实对照均已通过。
+
+### Day6 完成记录（2026-11-13）
+
+- 已完成 Retriever 异步调用、Function Tool 注册及 Runner 注入本轮 context 三个学习点。
+- 当前仓库完整离线验收：22 passed、2 skipped；跳过项为显式真实模型测试。
+- 用户已运行两项真实对照，助手复核本地六份报告：两题均成功执行直接链和 SDK 工具闭环，每题两条路径的 Context 相同。
+- NOT_FOUND 问题的两份回答均正确区分查询未找到与任务执行失败，结论有对应原文支持；实时状态问题均返回 insufficient，明确缺少实时 API 查询结果。
+- SDK 每题实际执行一次 search_knowledge 和两次模型请求；call_id、query、工具返回证据及最终引用对应，来源保留 current 状态和 2.0 版本。
+- 真实用量仅记录 SDK 报告值，不补算既有直接生成器没有提供的用量，也不据单次耗时给出性能结论。
+- 默认使用主项目 `.venv`；运行产物不提交。本次收尾只运行离线测试，没有重复调用真实模型。
+
+### 学习内容与验收目标
+
+| 学习内容 | 验收时需要解释或展示 |
+|---|---|
+| Retriever 是可复用组件 | 同一个 Day5 Retriever 可以被 Runnable 链调用，也可以在 SDK Function Tool 中调用 |
+| 工具 Schema 与本地 context | 模型只提供 query；索引、k、过滤条件、预算由程序注入，不出现在工具参数 Schema 中 |
+| SDK 的工具闭环 | 第一次模型响应要求检索；工具实际执行；SDK 将结果交给模型继续生成回答 |
+| 引用与版本保留 | 工具返回预算内原文及 source/version，最终引用只在本次实际返回的 Context 中查找 |
+| 两种写法的边界 | Day5 由程序固定安排检索后生成；Day6 由 SDK 执行工具调用及后续模型步骤，检索工具本身不生成答案 |
+| 空证据与执行错误 | 无证据可以返回 insufficient；超时、调用失败、虚构引用必须作为执行失败记录 |
+
+完成标准已达到：三个连接点通过完整离线测试，两项真实对照已执行，并核对了实际工具调用、证据和回答。
+本日独立的 SDK Agent 示例使用主项目相同的 Agent、Runner、Function Tool 接口；`agentLite.py` 与通用 `agentPrompts.py` 保持现有实现。
+以后需要接入某个已有 Agent 时，可把 `search_knowledge` 加到该 Agent 的 tools，并由 Runner 注入对应 context；不同 Agent 的输出契约需要在接入时明确。
+
+### 文件、数据与依赖来源
+
+| 文件/数据 | 来源和用途 |
+|---|---|
+| rag/sdk_rag.py | 新增 SDK 连接层；包含工具、本轮 context、Agent 组装和执行报告 |
+| rag/langchain_rag.py | 复用 Day5 的 Retriever、索引保存/加载、Document 适配及直接 RAG 链 |
+| rag/answering.py | 复用 ContextBundle、字符预算、RagAnswer 和引用校验 |
+| tests/test_week8_day6.py | 合成两份知识、人工三维向量、ScriptedModel、完整断言和真实测试入口 |
+| Week7 知识清单 | 真实对照仍使用原 18 份文档、20 个正文单元及 64 个 Chunk |
+| Day5 local_model/knowledge_store.json | 默认复用已经验证的 Qwen3 索引；不存在时通过 Day5 prepare_store 建库 |
+
+默认使用主项目 `.venv`。现有 `openai-agents==0.22.2` 和 `langchain-core==1.7.6` 已满足本日要求，不需要另装 LangChain 集成包。
+离线数据和模型脚本都在测试文件中，无需手写新数据、下载模型或配置真实业务 API。
+真实调用沿用已有 DeepSeek `OPENAI_API_KEY`；该变量在本项目中保存 DeepSeek 凭据，不新增 OpenAI 平台密钥。
+
+### 已完成的三个学习点
+
+| 标识 | 函数与输入 | 已完成的动作 | 该行输出 |
+|---|---|---|---|
+| W8D6-1 | retrieve_context：已配置的 retriever、问题 query | await Retriever 的 ainvoke，赋给 documents | list[Document]；来源和本次分数都在结果中 |
+| W8D6-2 | build_sdk_rag_agent：SDK Model | 将已有 search_knowledge FunctionTool 放进 tools 列表 | list[FunctionTool]，交给 Agent 构造器 |
+| W8D6-3 | run_sdk_rag：agent、question、本次 state、max_turns | await Runner.run，传本轮 context、步数限制及禁用远程追踪的 RunConfig | RunResult，赋给 result；最终输出由 output_type 转成 RagAnswer |
+
+原三处单行填空现已完成，源码保留学习点说明。函数注释写明参数和返回类型。
+状态记录、JSON 保存、证据适配、预算、Schema 与引用校验均已提供。
+
+### 两种流程的对照
+
+```mermaid
+flowchart TB
+    question["同一个问题、索引和过滤配置"] --> direct["Day5：程序调用 Retriever"]
+    direct --> directContext["预算内 Context"]
+    directContext --> generator["已有生成器：一次模型调用"]
+    generator --> check["共同的 RagAnswer 与引用校验"]
+    question --> sdk["Day6：SDK Runner 调用模型"]
+    sdk --> call["模型请求 search_knowledge：只给 query"]
+    call --> tool["Function Tool：注入本地 context"]
+    tool --> retriever["LangChain Retriever.ainvoke"]
+    retriever --> evidence["适配与预算：返回 evidence JSON"]
+    evidence --> continuation["SDK 将工具结果交给模型继续回答"]
+    continuation --> check
+```
+
+本地 context 保存的是依赖和执行记录；模型看到的是工具返回的 evidence JSON。两者不是同一份数据。
+context 中的 Retriever 含向量库和编码器，不会整体序列化后发给模型。
+工具返回值是逐字证据而不是另一份 LLM 总结，避免在工具内部嵌套调用 Day5 的整条回答链。
+
+本日每次 Run 只允许成功进入一次检索，第二次调用在再次编码前停止；SDK max_turns 另行限制模型步骤。
+这个限制让 S1/S2 编号只属于一份 Context，不需要实现多次检索的编号合并。后续扩展时再设计合并规则。
+
+Day5 的直接链在无证据时可由程序跳过生成；Day6 通常仍有两次模型步骤：请求工具、接收空 evidence 后生成拒答。
+因此“工具没有调用回答型 LLM”和“整次 Agent Run 没有模型调用”必须区分。
+
+### 运行顺序与产物
+
+在仓库根目录执行。只检查框架辅助部分时：
+
+```bash
+RUN_WEEK8_DAY6=0 RUN_WEEK8_DAY6_LLM=0 \
+.venv/bin/python -B -m pytest tests/test_week8_day6.py -q -s -p no:cacheprovider
+```
+
+运行当前实现的完整离线验收：
+
+```bash
+RUN_WEEK8_DAY6=1 RUN_WEEK8_DAY6_LLM=0 \
+.venv/bin/python -B -m pytest tests/test_week8_day6.py -q -s -p no:cacheprovider
+```
+
+框架自检为 9 passed、15 skipped；当前仓库完整离线验收为 22 passed、2 skipped，跳过两项真实对照。
+测试使用仓库既有的本地 TraceProvider 隔离方式，不向外网导出追踪，也不依赖终端代理初始化远程导出器。
+
+离线通过后，再显式运行真实对照：
+
+```bash
+RUN_WEEK8_DAY6=1 RUN_WEEK8_DAY6_LLM=1 \
+.venv/bin/python -B -m pytest \
+tests/test_week8_day6.py::test_real_direct_chain_and_sdk_tool -v -s -p no:cacheprovider
+```
+
+这条命令运行两道题，每题分别执行 Day5 直接链和 Day6 SDK 工具闭环。常见情况下每题为一次直接生成及两次 SDK 模型步骤；实际请求数以 SDK 报告为准。
+需要已启动的 Ollama、已拉取的 qwen3-embedding:0.6b，以及可用的既有 DeepSeek 配置。用户已运行并通过，助手复核实际报告；本次收尾没有重复调用。
+
+| 输出文件，根目录为 langchain_learning/artifacts/day6/ | 内容 |
+|---|---|
+| offline/sdk_report.json | 脚本模型驱动的真实 SDK 工具闭环、call_id、证据、引用和合成 usage |
+| offline/comparison_report.json | 同一人工向量下，两种写法的 Context 与引用对照 |
+| real_model/grounded_direct.json、grounded_sdk.json | NOT_FOUND 问题的两条真实执行路径 |
+| real_model/realtime_direct.json、realtime_sdk.json | 实时状态问题的两条真实执行路径 |
+| real_model/grounded_comparison.json、realtime_comparison.json | 两条路径的完整报告及 same_context 对照值 |
+
+WEEK8_DAY6_OUTPUT 可修改报告根目录；WEEK8_DAY6_STORE 可修改真实索引路径。
+默认读取 Day5 的索引，报告目录的改变不会自动改变索引路径。源文档或模型变更时按 Day5 的显式重建约定处理。
+独立路径报告会记录失败和异常阶段；comparison 文件只在两条路径均执行成功后产生。
+不要用旧 comparison 文件判断本次执行成功，先查看本次 pytest 结果及对应 direct/sdk 报告。
+
+### 测试一（Day6）：工具 Schema 只暴露 query
+
+函数：`test_provided_tool_schema_only_exposes_query`，默认执行。
+
+- **数据来源**：实际 `@function_tool` 生成的工具对象。
+- **流程**：检查工具说明与输入 JSON Schema。
+- **检查点**：必填字段只有字符串 query；索引、过滤配置和 wrapper 没有进入模型参数。
+- **输出**：pytest 结果，无文件。
+
+### 测试二（Day6）：只验证本次实际返回的 Context
+
+函数：`test_provided_validation_uses_this_runs_context`，默认执行，三组。
+
+- **数据来源**：合成 GOOD 片段和错误回答，分别模拟未检索、S99 及引用旧版原文。
+- **流程**：直接调用已提供的最终校验函数。
+- **检查点**：没有检索不能通过；Context 外来源和摘录不能借用其他历史知识补齐。
+- **输出**：pytest 结果，无文件。
+
+### 测试三（Day6）：非法 query 不执行检索
+
+函数：`test_provided_bad_query_never_reaches_retriever`，默认执行，四组。
+
+- **数据来源**：空串、空白、None、整数，使用真实 ToolContext 调用工具。
+- **流程**：SDK 参数校验或工具非空校验先行拒绝。
+- **检查点**：工具未进入检索步骤，没有编码器调用或正常空证据返回。
+- **输出**：pytest 结果，无文件。
+
+### 测试四（Day6）：检索异常不冒充空结果
+
+函数：`test_provided_tool_error_is_not_empty_evidence`，默认执行。
+
+- **数据来源**：测试侧注入的 TimeoutError，不访问网络。
+- **流程**：工具记录实际失败类型，再抛出异常。
+- **检查点**：没有成功 Context，记录为 failed，调用方收到异常。
+- **输出**：pytest 结果，无固定报告。
+
+### 测试五（Day6）：异步调用 Retriever 与预算
+
+函数：`test_retrieve_context_reuses_day5_contract`，完整离线开关启用，三组。
+
+- **数据来源**：人工三维向量、旧版和当前版两条知识，以及不存在的版本或过小预算。
+- **流程**：异步调用 Retriever，Document → hits → Context。
+- **检查点**：只选当前版，source/version 保留；无候选不编码，预算不足可检索但无可用 Context；不编码正文。
+- **输出**：pytest 结果，无文件。
+
+### 测试六（Day6）：注册工具与结构化输出
+
+函数：`test_agent_registers_tool_and_existing_output_contract`，完整离线开关启用。
+
+- **数据来源**：空脚本模型和实际检索 FunctionTool。
+- **流程**：将 FunctionTool 注册到 Agent。
+- **检查点**：tools 中注册正确对象，output_type 复用 RagAnswer，构造不执行模型或 MCP。
+- **输出**：pytest 结果，无文件。
+
+### 测试七（Day6）：完整 SDK 工具闭环
+
+函数：`test_sdk_loop_returns_tool_evidence_to_model`，完整离线开关启用。
+
+- **数据来源**：ScriptedModel 先产生工具调用，再根据第二次请求中的实际工具输出组织假回答；移除测试中的 API Key。
+- **流程**：由 Runner 真正调用工具，再继续模型步骤。
+- **检查点**：两次脚本模型步骤，一次问题编码；call_id 对应，Context 确实进入第二次请求，最终引用解析到 GOOD。
+- **输出**：offline/sdk_report.json；脚本 usage 是合成值，不能当作真实模型用量。
+
+### 测试八（Day6）：空证据也完成 SDK 拒答
+
+函数：`test_empty_evidence_still_finishes_sdk_loop`，完整离线开关启用，两组。
+
+- **数据来源**：不存在的版本和只能容纳一个字符的预算。
+- **流程**：工具返回空 evidence，SDK 继续执行脚本模型的拒答步骤。
+- **检查点**：insufficient、无引用，仍有两次模型步骤；无候选不编码问题，预算不足允许一次问题编码。
+- **输出**：pytest 结果，无固定报告。
+
+### 测试九（Day6）：跳过工具直接回答被拒绝
+
+函数：`test_answer_without_retrieval_is_rejected_and_recorded`，完整离线开关启用。
+
+- **数据来源**：脚本模型第一步就返回格式正确的回答。
+- **流程**：SDK 返回后，程序检查本次是否有成功检索。
+- **检查点**：不能只凭格式正确通过，记录 citation_validation 阶段失败。
+- **输出**：pytest 临时目录 no_tool.json。
+
+### 测试十（Day6）：错误引用保留定位证据
+
+函数：`test_bad_citation_preserves_answer_and_actual_evidence`，完整离线开关启用，两组。
+
+- **数据来源**：SDK 正常检索后，脚本模型返回 S99 或旧版片段的摘录。
+- **流程**：格式解析成功，最终引用校验失败。
+- **检查点**：保存实际回答、实际 Context 和失败阶段，不替换成正常 insufficient。
+- **输出**：pytest 临时目录 unknown_source.json、invented_quote.json。
+
+### 测试十一（Day6）：限制重复检索
+
+函数：`test_second_search_stops_before_more_embedding`，完整离线开关启用。
+
+- **数据来源**：脚本模型连续两步都要求检索。
+- **流程**：第一次成功，第二次在编码前停止；当前 SDK 将普通工具异常包装为 UserError。
+- **检查点**：只有一次编码和一份成功证据，报告停在 sdk_run，不无限重试。
+- **输出**：pytest 临时目录 second_search.json。
+
+### 测试十二（Day6）：Run 之间隔离本地状态
+
+函数：`test_runs_have_separate_local_context`，完整离线开关启用。
+
+- **数据来源**：同一向量库上先运行有结果查询，再运行无匹配版本查询。
+- **流程**：两次调用 run_sdk_rag，分别创建 state。
+- **检查点**：第二轮没有借用第一轮的来源；第一轮报告保持原样，每轮只有自己的调用记录。
+- **输出**：pytest 结果，无固定报告。
+
+### 测试十三（Day6）：直接链与 SDK 工具对照
+
+函数：`test_direct_chain_and_sdk_tool_share_context`，完整离线开关启用。
+
+- **数据来源**：同一问题、向量库、K、过滤条件和人工向量；两种替身都读取本次实际证据。
+- **流程**：分别执行 Day5 的 run_rag 和 Day6 的 run_sdk_rag。
+- **检查点**：Context、结构化回答及引用相同；每条路径各编码一次问题，没有工具内嵌套生成。
+- **输出**：offline/comparison_report.json。这里只证明接口与数据流兼容，不证明语义质量。
+
+### 测试十四（Day6）：两道真实问题的两种执行路径
+
+函数：`test_real_direct_chain_and_sdk_tool`，额外启用真实开关，两题。
+
+- **数据来源**：原 Week7 知识、真实 Qwen3 向量与既有 DeepSeek；问题为 NOT_FOUND 的含义和任务 12345 的当前状态。
+- **流程**：同一知识库分别执行直接链及 SDK 闭环，保留每条路径的报告。
+- **检查点**：前者 answered 且引用当前版原文；后者 insufficient 且无伪造引用；SDK 确实执行一次检索。
+- **输出**：real_model/ 下六份 direct/sdk/comparison 文件；还需人工阅读结论与证据是否对应。
+
+模型生成的检索 query 如果改写原问题，可能改变 Top-K；报告保留 query 和 same_context 供定位，不强行要求两份自然语言回答逐字相同。
+SDK 报告中的 usage 仅代表 SDK 路径；既有直接生成器没有提供用量，不能据此捏造另一条路径的 Token 数。
+本日耗时只用于观察，正式复杂度、延迟及 Token 对照留到 Day7；当前先把连接边界解释清楚。
+
+官方资料：[OpenAI Agents SDK](https://developers.openai.com/api/docs/guides/agents/sdk)、[Agent 与工具定义](https://developers.openai.com/api/docs/guides/agents/define-agents)、[LangChain Retriever](https://docs.langchain.com/oss/python/langchain/knowledge-base)。

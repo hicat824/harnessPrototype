@@ -20,5 +20,7 @@ Week7 Day1～Day7 已完成，完整学习内容已汇总到 [week7.md](week7.md
 - 沿用 Week7 同一知识集；实现放在 `rag/`，默认使用主项目 `.venv`。
 - [Day5：Vector Store、Retriever 与检索回答链（已完成）](../langchain_learning/week8.md#day5)
 - Day5 实现：[langchain_rag.py](langchain_rag.py)，测试：[test_week8_day5.py](../tests/test_week8_day5.py)。
+- [Day6：将 Retriever 接入 Agents SDK（已完成）](../langchain_learning/week8.md#day6)
+- Day6 实现：[sdk_rag.py](sdk_rag.py)，测试：[test_week8_day6.py](../tests/test_week8_day6.py)。
 
 本文件用于目录导航。Week7 学习内容与逐项测试维护在 `week7.md`，Week8 对应说明维护在 `langchain_learning/week8.md`。
