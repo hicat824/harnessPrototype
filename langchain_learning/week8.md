@@ -1,10 +1,82 @@
-# Week8：LangChain 学习
+# Week8：LangChain 学习（已完成）
 
 > 基准计划：`/home/xumaozhou/Music/agent_engineer_learning_plan_v4_mcp.md`。
-> 当前进度（2026-11-13）：**Day1～Day6 已完成，下一步 Day7：框架对比周验收**。
+> 当前进度（2026-11-17）：**Day1～Day7 已完成；下一阶段为 Week9：RAG 质量优化、知识版本管理与 Evals**。
 > 默认使用主项目 `.venv`；知识库代码放在 `rag/`，关联测试放在 `tests/`。主项目的 Agents SDK 和 Week7 既有实现保持原样。
 
-向量库与检索链的完成记录见 [Day5 章节](#day5)；SDK 工具集成的实现与逐项验收见 [Day6 章节](#day6)。
+本周总结见 [完成记录与选型结论](#week8-completion)；各日代码、数据来源和逐项测试保留在下方对应章节。
+
+<a id="week8-completion"></a>
+
+## 本周完成记录与选型结论（2026-11-17）
+
+本周完成了 LangChain 模型调用、Prompt、Runnable、Parser、工具校验、文档准备、向量库和 Retriever 的学习，
+并在同一份 Week7 知识数据上运行了 LangChain RAG，验证它可以通过 Function Tool 被 Agents SDK 调用。
+知识库组件放在 `rag/`，主项目继续使用 Agents SDK 编排；本周没有强制迁移 AgentLite 或改动通用 Agent 提示词。
+
+| 日期阶段 | 已掌握和完成的内容 | 主要入口 |
+|---|---|---|
+| Day1 | Models、Messages、历史显式传入及与 SDK Run 的职责区别 | langchain_learning/day1.py |
+| Day2 | Prompt Template、partial 绑定、Runnable 数据流、Parser 与来源检查 | langchain_learning/day2.py |
+| Day3 | Tool Schema、Pydantic 参数校验及 Mock 业务工具闭环 | langchain_learning/day3.py |
+| Day4 | Manifest Loader、Document、节内分块和 Embeddings 适配 | rag/langchain_preparation.py |
+| Day5 | InMemoryVectorStore、缓存、精确过滤、Top-K 与检索回答链 | rag/langchain_rag.py |
+| Day6 | Retriever 作为 SDK Function Tool，本地 context 注入与最终引用校验 | rag/sdk_rag.py |
+| Day7 | 同快照下对照原生 Python 与 LangChain RAG，记录用量、耗时及失败阶段 | rag/comparison.py |
+
+本周真实验收由用户运行；助手复核了已留存的消息、检索和回答报告。收尾只运行离线回归，不重复请求真实生成模型。
+本周 Day1～Day7 的完整离线回归为 **217 passed、15 skipped**；15 个跳过项均为显式真实模型测试。
+Day7 三道代表题的六份路径报告均成功，语义复核通过：NOT_FOUND 不等于任务执行失败；历史 1.0 版 limit 默认值与上限均为 30；
+任务 12345 的当前状态需要实时 API，两条路径均没有从静态文档编造当前状态。
+
+验收证据按来源区分：Day7 三题生成对照及 15 题离线检索有本地报告；用户已确认真实测试通过。
+默认目录下没有留存 Day7 独立的 `local_model/retrieval_report.json`，因此不声称逐项复核了该报告。
+本周已保存并核对的 15 题真实检索证据位于 Day5 的 `local_model/retrieval_report.json`：13 题有预期文档组且全部召回，另 2 题不适用召回率，版本检查全部通过。
+
+### 对照结果与解释
+
+| 代表问题 | 原生总 Token | LangChain 总 Token | 原生耗时/秒 | LangChain 耗时/秒 | 人工复核 |
+|---|---|---|---|---|---|
+| NOT_FOUND 的含义 | 3038 | 2467 | 8.7696 | 2.4332 | 两边均由 KB012/KB006 原文支持 |
+| 历史 1.0 版 limit | 2419 | 2380 | 2.0530 | 1.8886 | 两边均正确引用 KB009 的历史规则 |
+| 任务 12345 当前状态 | 2337 | 2250 | 2.5638 | 1.8144 | 两边均说明缺少实时 API 结果 |
+
+数据来自 2026-11-17 的 Day7 真实批次，每条路径各进行一次生成；用量是 SDK 报告值。
+三题的 Chunk 排序相同，正文、元数据和预算排除项也相同。Context 与消息的精确比较为 False，
+差别仅为余弦分数的浮点精度，最大绝对差约 1.23e-15。
+模型输出 Token 和单次耗时存在差异；顺序执行、输入数值序列化和生成响应差异都使这组数据不构成框架性能结论。
+
+### 什么时候保留手写实现，什么时候使用框架
+
+- 原生实现适合当前这种小语料学习与基准验证：过滤、相似度、索引映射和 Context 构建过程直接可见，便于核对算法与定位数据错误。
+- LangChain 的 Document、Embeddings、Vector Store、Retriever 和 Runnable 提供了统一接口，后续替换组件或组合知识处理流程更方便；来源、版本、预算和引用规则仍由应用明确实现。
+- 两者共用 `rag/answering.py` 的预算、消息、结构和引用校验，这些规则不是换框架后自动获得的。
+- Agents SDK 继续负责主 Agent 的工具循环与编排；LangChain 的 Retriever 可作为普通 Python 组件被 SDK 工具调用，不需要迁移整个 Agent。
+- 本周测试证明当前数据集和已覆盖场景可运行，不证明任意问题都能正确召回或生成。下一周继续学习检索质量、版本与评估，之后再根据需求选择组件。
+
+### 主要产物与复核入口
+
+- 各日真实产物：`langchain_learning/artifacts/day1/` 至 `day7/`；运行产物与虚拟环境不提交。
+- Day7 批次明细：`artifacts/day7/real_model/comparison_report.json`，保留实际消息、证据、回答、用量和失败信息。
+- Day7 人可读表格：`artifacts/day7/real_model/comparison_report.md`；已补充本批次人工结论。生成器对未来批次仍使用待复核模板，原始 JSON 的自动评分字段保持原样。
+- 原生基线与本周实现：`rag/retrieval.py`、`rag/answering.py`、`rag/langchain_preparation.py`、`rag/langchain_rag.py`、`rag/sdk_rag.py`、`rag/comparison.py`。
+- 所有运行命令默认使用仓库根目录下的 `.venv/bin/python`。
+
+### 全周离线回归命令
+
+```bash
+RUN_WEEK8_DAY1=1 RUN_WEEK8_DAY1_LLM=0 \
+RUN_WEEK8_DAY2=1 RUN_WEEK8_DAY2_LLM=0 \
+RUN_WEEK8_DAY3=1 RUN_WEEK8_DAY3_LLM=0 \
+RUN_WEEK8_DAY4=1 RUN_WEEK8_DAY4_MODEL=0 \
+RUN_WEEK8_DAY5=1 RUN_WEEK8_DAY5_MODEL=0 RUN_WEEK8_DAY5_LLM=0 \
+RUN_WEEK8_DAY6=1 RUN_WEEK8_DAY6_LLM=0 \
+RUN_WEEK8_DAY7=1 RUN_WEEK8_DAY7_MODEL=0 RUN_WEEK8_DAY7_LLM=0 \
+.venv/bin/python -B -m pytest \
+tests/test_week8_day1.py tests/test_week8_day2.py tests/test_week8_day3.py \
+tests/test_week8_day4.py tests/test_week8_day5.py tests/test_week8_day6.py \
+tests/test_week8_day7.py -q -p no:cacheprovider
+```
 
 ## Day1 完成记录
 
@@ -1943,3 +2015,276 @@ SDK 报告中的 usage 仅代表 SDK 路径；既有直接生成器没有提供�
 本日耗时只用于观察，正式复杂度、延迟及 Token 对照留到 Day7；当前先把连接边界解释清楚。
 
 官方资料：[OpenAI Agents SDK](https://developers.openai.com/api/docs/guides/agents/sdk)、[Agent 与工具定义](https://developers.openai.com/api/docs/guides/agents/define-agents)、[LangChain Retriever](https://docs.langchain.com/oss/python/langchain/knowledge-base)。
+
+<a id="day7"></a>
+
+## Day7：框架对比周验收（已完成）
+
+实现：[comparison.py](../rag/comparison.py)。测试：[test_week8_day7.py](../tests/test_week8_day7.py)。
+本日把已有组件放到同一组条件下运行，观察框架接口的收益、代价和错误定位方式。
+三处关键步骤已完成；完整离线验收通过，真实三题生成对照及人工语义复核已完成，结果见本周总结。
+
+### 学习内容与验收目标
+
+| 学习内容 | 验收目标 |
+|---|---|
+| 控制对照条件 | 两边使用同一知识快照、Embedding 配置、问题、K、过滤条件、Context 预算和生成适配器 |
+| 比较检索与证据 | 能查看两边返回的 Chunk、来源、版本、排序和最终 Context；同分或微小浮点差异单独解释 |
+| 观察调用与耗时 | 记录实际生成调用次数、总耗时和生成耗时；区分已知用量、未提供用量及未调用模型 |
+| 定位失败 | 区分检索/Context、生成和回答解析/引用校验阶段；一条路径失败不隐藏另一条路径 |
+| 理解代码规模与职责 | 阅读实现文件及共同回答层，说明 LangChain 提供了哪些抽象；文件行数只作导航 |
+| 形成选型结论 | 在生成的 Markdown 中补充使用场景、收益及局限，不能只写“测试通过” |
+
+**每日验收的含义**：交出两份产物——机器可检查的 JSON 明细，以及人能阅读并补充结论的 Markdown 对照报告。
+不要求证明某个框架一定更快或更省 Token；需要能根据实际输入、调用、输出和错误，解释两种实现的差别。
+Week7 原生实现继续作为基线，Day5 的 Runnable 链作为 LangChain 路径；Day6 的工具闭环示例保留供理解 SDK 编排职责。
+
+### 数据、代码与测量来源
+
+| 数据或代码 | 来源与作用 |
+|---|---|
+| rag/retrieval.py、rag/answering.py | 原生索引、ask_knowledge、共同 Context 预算、消息和引用校验 |
+| rag/langchain_rag.py | Day5 的向量库、Retriever、run_rag 与 Runnable 链 |
+| rag/comparison.py | 还原同一向量快照、调用两条已有路径、记录指标并生成对照报告 |
+| tests/test_week8_day7.py | 两份合成知识、三个小用例、人工向量、脚本模型及完整断言；无需填写测试代码 |
+| rag/eval_cases_day6.json | 复用 Week7 的 15 个固定问题、过滤条件、K 与评估参考项 |
+| Week7 manifest.json | 真实知识仍为原 18 份文件，分为 64 个 Chunk，不索引参考答案 |
+| Day5 local_model/knowledge_store.json | 默认复用已验证的 Qwen3 向量库，不为原生路径重新编码正文 |
+
+native_index_from_store 从同一份 Day5 向量库恢复原生 KnowledgeIndex，并深拷贝内容；snapshot_id 覆盖正文、元数据、向量及编码配置。
+两个真实生成路径共用 OneShotSDKGenerator，均为无工具的一次模型调用，保留 SDK 报告的实际用量；最终仍走原有结构和引用校验。
+它只是本日的共同 Generate 适配器，没有更改 Week7 的 DeepSeekGenerator，也不在两条路径中额外嵌套检索工具或回答链。
+默认使用主项目 `.venv` 和既有 DeepSeek 配置，没有新增依赖或模型下载。
+
+### 已完成的三个学习点
+
+| 标识 | 函数与输入 | 已完成的关键步骤 | 输出 |
+|---|---|---|---|
+| W8D7-1 | _run_path 的 native 分支；question、index、store.embedding.encoder、observed_generate、k、filters、max_context_chars | await ask_knowledge，赋给 report | 原生 RAG 的问题、Context、回答和引用报告 |
+| W8D7-2 | _run_path 的 langchain 分支；同一 question、store、observed_generate 及相同配置 | await run_rag，赋给 report | LangChain RAG 的实际执行报告 |
+| W8D7-3 | token_delta；已校验的 native_total、langchain_total | 任一边为 None 返回 None，否则计算 LangChain 减原生路径的用量 | int 或 None；真实的零参与计算 |
+
+原三处单行填空现已完成，源码保留输入、输出、配置来源和学习点说明；继续复用已有检索、模型调用与报告代码。
+None 表示未提供，0 表示确实报告为零；不要写成把所有假值都当“没有数据”的判断。
+
+### 对照流程
+
+```mermaid
+flowchart TB
+    store["同一份 Day5 向量库"] --> nativeIndex["还原 Week7 KnowledgeIndex"]
+    store --> lc["Day5 LangChain RAG"]
+    nativeIndex --> native["Week7 原生 RAG"]
+    question["同一问题、K、过滤条件与预算"] --> native
+    question --> lc
+    native --> nativeContext["原生检索与 Context"]
+    lc --> lcContext["Retriever、Runnable 与 Context"]
+    nativeContext --> shared["同一单次生成适配器与输出校验"]
+    lcContext --> shared
+    shared --> records["分别保存消息、回答、引用、用量与失败阶段"]
+    records --> report["comparison_report.json 与 comparison_report.md"]
+    report --> review["人工核对语义并补充框架适用场景"]
+```
+
+原始参考要点只在评分函数中使用，不进入生成器消息。两条路径都调用旧入口，避免为对照重新实现另一套 RAG。
+生成对照中，每条有候选的路径各编码一次问题；不重新编码正文。15 题的单独检索测试则重放本题问题向量，排除两次编码的数值差异，不测回答或端到端延迟。
+
+### 怎样理解指标与完成边界
+
+| 字段 | 含义与限制 |
+|---|---|
+| snapshot_id | 两边共用的知识快照；不是模型回答的唯一标识 |
+| same_ranked_ids | Chunk 顺序是否完全相同；同分可能换序，不直接等于语义失败 |
+| same_context、same_messages | 实际证据与消息是否完全相同；浮点分数格式也可能影响精确比较，需结合原文查看 |
+| generation_calls | 程序实际进入生成适配器的次数；空证据应为零 |
+| metrics.usage | 适配器提供的 SDK 用量；未提供则 None，禁止按文本长度猜测 |
+| token_delta | LangChain total_tokens 减原生 total_tokens；任一边未知则 None |
+| elapsed_seconds、generation_seconds | 运行与生成的实测耗时，均不含建库；剩余部分还含解析、预算等，不能直接称为纯检索耗时 |
+| error.stage | retrieval_or_context、generation 或 answer_validation；第一项是合并阶段，不进一步猜测具体失败点 |
+| automatic_passed | 执行、文档组召回、版本、回答状态和生成模型标签的初筛，不证明结论受证据充分支持 |
+| semantic_review | 离线为 fixture_only；真实初筛通过为 needs_review；初筛失败为 failed |
+
+两条路径顺序执行，后运行的路径可能受缓存预热影响，模型和网络也有波动；单次差值只用来观察，不据此写性能结论。
+报告给出的文件行数和函数数仅反映当前文件规模；共同的 rag/answering.py 不能重复算成某一方独有实现，也不能把行数直接当“开发复杂度”。
+最终阅读两边的消息和证据，解释代码职责、引用是否支持回答，以及在哪类任务中使用框架组件更方便。
+
+### 运行顺序与输出文件
+
+均在仓库根目录执行。只检查辅助部分时：
+
+```bash
+RUN_WEEK8_DAY7=0 RUN_WEEK8_DAY7_MODEL=0 RUN_WEEK8_DAY7_LLM=0 \
+.venv/bin/python -B -m pytest tests/test_week8_day7.py -q -s -p no:cacheprovider
+```
+
+运行当前代码的完整离线验收：
+
+```bash
+RUN_WEEK8_DAY7=1 RUN_WEEK8_DAY7_MODEL=0 RUN_WEEK8_DAY7_LLM=0 \
+.venv/bin/python -B -m pytest tests/test_week8_day7.py -q -s -p no:cacheprovider
+```
+
+框架自检为 8 passed、17 skipped；当前仓库完整离线验收为 23 passed、2 skipped，跳过两项真实测试。
+
+真实 Ollama 的 15 题检索对照，不调用回答模型：
+
+```bash
+RUN_WEEK8_DAY7=1 RUN_WEEK8_DAY7_MODEL=1 RUN_WEEK8_DAY7_LLM=0 \
+.venv/bin/python -B -m pytest \
+tests/test_week8_day7.py::test_real_fifteen_retrieval_comparisons -v -s -p no:cacheprovider
+```
+
+真实三题生成对照，两条路径各执行一次：
+
+```bash
+RUN_WEEK8_DAY7=1 RUN_WEEK8_DAY7_MODEL=1 RUN_WEEK8_DAY7_LLM=1 \
+.venv/bin/python -B -m pytest \
+tests/test_week8_day7.py::test_real_three_case_framework_comparison -v -s -p no:cacheprovider
+```
+
+三题从原题集中选择 W7D6-01、W7D6-07、W7D6-15，分别观察 NOT_FOUND、有明确历史版本的规则、实时状态问题。
+正常情况下三题两条路径共六次生成调用；实际用量以报告为准。15 题检索与三题生成是两个范围，不描述为 15 条真实回答全部通过。
+真实测试需已启动的 Ollama、已拉取的 qwen3-embedding:0.6b，以及项目既有 DeepSeek OPENAI_API_KEY。用户已确认测试通过；本次收尾复核已有真实生成报告，不重复调用在线模型。独立 15 题真实报告的本地留存情况见本周总结。
+
+| 文件，根目录为 langchain_learning/artifacts/day7/ | 生成来源与内容 |
+|---|---|
+| offline/comparison_report.json | 三个合成用例两条完整路径的结构化明细与脚本用量 |
+| offline/comparison_report.md | 同一离线批次的人可读表格，仅验证生成报告的流程 |
+| offline/cases/用例ID_native.json、用例ID_langchain.json | 各路径的原始消息、回答、引用和执行错误 |
+| offline/retrieval_report.json | 原 15 题配人工向量的检索实现对照，不评估语义召回 |
+| local_model/retrieval_report.json | 15 题实际 Qwen3 检索、文档组召回、版本及来源对照 |
+| real_model/comparison_report.json | 三道真实问题的两条完整回答路径 |
+| real_model/comparison_report.md | 真实框架对照表及待补充的人工结论 |
+| real_model/cases/用例ID_native.json、用例ID_langchain.json | 真实问题逐路径的实际消息、用量、结果或错误 |
+
+WEEK8_DAY7_OUTPUT 修改报告根目录；WEEK8_DAY7_STORE 修改真实索引路径，默认读取 Day5 的真实库。
+批量处理逐题覆盖当前 comparison_report.json/md，单路径失败也会落盘，并继续后续问题。
+这些文件记录的是一次学习运行；旧同名报告不能证明新运行成功，应同时核对本次 pytest 结果与输出路径。
+
+### 测试一（Day7）：从同一向量库恢复原生索引
+
+函数：`test_provided_index_uses_existing_vectors_without_embedding`，默认执行。
+
+- **数据来源**：两份合成知识和人工三维向量，已由 Day5 的 build_store 入库。
+- **流程**：native_index_from_store → 修改返回副本。
+- **检查点**：ID、向量和顺序相同，不触发编码，不修改原向量库或原元数据。
+- **输出**：pytest 断言，无文件。
+
+### 测试二（Day7）：知识快照标识
+
+函数：`test_provided_snapshot_tracks_content_and_configuration`，默认执行。
+
+- **数据来源**：同一合成索引，以及改动查询前缀的副本。
+- **流程**：分别计算 snapshot_id。
+- **检查点**：相同内容标识一致，配置变化可识别，不把向量另写进报告。
+- **输出**：pytest 断言，无文件。
+
+### 测试三（Day7）：共同生成适配器
+
+函数：`test_provided_single_generation_adapter_preserves_text_and_usage`，默认执行。
+
+- **数据来源**：ScriptedModel 的原始 JSON 文本及明确注入的合成 usage；移除测试 API Key。
+- **流程**：真实 SDK 执行一次无工具模型步骤，返回文本供旧回答层处理。
+- **检查点**：规则和用户消息正确传入，模型步骤恰好一次，无工具，原文和用量保留。
+- **输出**：pytest 断言；不代表真实 API 调用。
+
+### 测试四（Day7）：拒绝非法用量
+
+函数：`test_provided_invalid_usage_is_rejected`，默认执行，四组。
+
+- **数据来源**：bool、负数、数字字符串和错误 usage 容器。
+- **流程**：进入已提供的 token_delta 参数校验。
+- **检查点**：非法值不能作为正常计数，三处填空未实现时也可自检。
+- **输出**：pytest 断言，无文件。
+
+### 测试五（Day7）：Markdown 报告可读性
+
+函数：`test_provided_report_is_human_readable_and_marks_unknown_values`，默认执行。
+
+- **数据来源**：一条失败记录、未知用量及当前源文件规模。
+- **流程**：调用 render_report。
+- **检查点**：未知显示为“未提供”，失败阶段可见，包含文件职责及待人工复核说明。
+- **输出**：内存中的 Markdown 文本，无固定文件。
+
+### 测试六（Day7）：未知和零的差别
+
+函数：`test_token_delta_distinguishes_unknown_and_zero`，完整离线开关启用，六组。
+
+- **数据来源**：缺字段、None、真实零及两组非零计数。
+- **流程**：计算已知用量的差值，保留未知值。
+- **检查点**：未知返回 None，零参与计算，差值方向为 LangChain 减原生。
+- **输出**：pytest 断言，无文件。
+
+### 测试七（Day7）：两条完整路径对照
+
+函数：`test_both_paths_run_same_cases_and_preserve_sources`，完整离线开关启用。
+
+- **数据来源**：当前版、历史版、无匹配版本三个合成用例；固定向量与从实际证据构造回答的替身。
+- **流程**：复用 ask_knowledge 与 run_rag，逐路径生成报告。
+- **检查点**：同一快照和模型标签，ID/版本正确，参考项未进入消息，查询不编码正文，空证据跳过生成。
+- **输出**：offline/comparison_report.json/md 及 cases/ 下六份路径明细；全部为离线数据。
+
+### 测试八（Day7）：未报告用量不补零
+
+函数：`test_unreported_usage_is_not_fabricated`，完整离线开关启用。
+
+- **数据来源**：正常返回 JSON、但没有提供用量的生成替身。
+- **流程**：两条路径成功完成后整理指标。
+- **检查点**：生成调用为一次，usage 和差值仍为 None；执行成功不等于用量已知。
+- **输出**：pytest 临时目录的批次和路径报告。
+
+### 测试九（Day7）：分阶段错误定位
+
+函数：`test_failures_keep_stage_raw_answer_and_continue`，完整离线开关启用，四组。
+
+- **数据来源**：模拟编码超时、生成超时、非法 JSON 和 S99 错误引用。
+- **流程**：分别让两条路径失败，保存当前实际信息。
+- **检查点**：失败阶段正确；JSON/引用错误保留原始回答和消息；失败不冒充 insufficient。
+- **输出**：pytest 临时目录中的 comparison_report.json/md 和两份 cases 明细。
+
+### 测试十（Day7）：一边失败后继续其他任务
+
+函数：`test_one_failed_path_does_not_skip_other_paths_or_cases`，完整离线开关启用。
+
+- **数据来源**：仅第一条路径注入生成超时，其他路径使用正常替身。
+- **流程**：依次运行三个用例。
+- **检查点**：另一条路径和后续用例仍有结果；批次自动检查为失败，没有隐藏错误。
+- **输出**：pytest 临时目录的完整批次报告。
+
+### 测试十一（Day7）：生成模型不一致可见
+
+函数：`test_different_generation_models_are_visible`，完整离线开关启用。
+
+- **数据来源**：两条路径故意声明不同生成模型标签。
+- **流程**：正常执行后检查对照条件。
+- **检查点**：same_generation_model=False，不能把条件不一致的比较标为自动通过。
+- **输出**：pytest 临时目录报告。
+
+### 测试十二（Day7）：原 15 题的离线检索对照
+
+函数：`test_fifteen_questions_compare_existing_retrievers_without_generation`，完整离线开关启用。
+
+- **数据来源**：原知识集、原问题和过滤条件；使用人工三维向量。
+- **流程**：LangChain 检索后，原生路径重放同一问题向量。
+- **检查点**：结果数量、分数容差、Chunk 和版本对照，不调用生成器，不把人工向量用于语义召回评价。
+- **输出**：offline/retrieval_report.json，recall_evaluated=False。
+
+### 测试十三（Day7）：15 题真实检索对照
+
+函数：`test_real_fifteen_retrieval_comparisons`，另行启用 MODEL。
+
+- **数据来源**：原知识集、实际 Qwen3 索引和原评估题的预期文档组。
+- **流程**：逐题检索并重放问题向量，比较两个后端。
+- **检查点**：分数、来源和版本正确；有预期文档组的题目召回完整，无预期组记为不适用。
+- **输出**：local_model/retrieval_report.json，不调用回答型 LLM。
+
+### 测试十四（Day7）：三题真实回答与对照报告
+
+函数：`test_real_three_case_framework_comparison`，另行启用 MODEL 和 LLM。
+
+- **数据来源**：原题集中的 NOT_FOUND、历史版本规则、实时状态三题，真实 Qwen3 与既有 DeepSeek。
+- **流程**：同一模型适配器分别运行三题的两条完整路径，逐题落盘。
+- **检查点**：两边执行成功、文档组召回与版本适用、回答状态符合预期；真实语义仍标为 needs_review。
+- **输出**：real_model/comparison_report.json/md 和六份 cases 明细。
+
+本日三题的两份回答及证据已复核；框架接口收益、适用场景与限制已整理到本周总结。
+手写版与 LangChain 版共享数据和模型，主项目继续由 Agents SDK 编排；后续进入 Week9 的 RAG 质量优化与评估。
