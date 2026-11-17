@@ -27,11 +27,13 @@ Week7 Day1～Day7 已完成，完整学习内容已汇总到 [week7.md](week7.md
 - [Day7：原生 Python 与 LangChain RAG 对照周验收（已完成）](../langchain_learning/week8.md#day7)
 - Day7 实现：[comparison.py](comparison.py)，测试：[test_week8_day7.py](../tests/test_week8_day7.py)。
 
-## Week9：RAG 质量优化与评估（Day1 已完成）
+## Week9：RAG 质量优化与评估（Day1、Day2 已完成）
 
 - [Day1：固定评估集、参考证据与输入隔离](week9.md#day1)。
 - 实现：[eval_dataset.py](eval_dataset.py)，测试：[test_week9_day1.py](../tests/test_week9_day1.py)。
 - 测试数据：`/media/xumaozhou/data/AI/local_agent_test/week9_rag_quality/`；30 道题、21 份合成知识。
-- 参考适用性与运行输入隔离已完成；完整离线验收 **49 passed**，下一阶段为 Day2 召回质量分析。
+- 参考适用性与运行输入隔离已完成；Day1 完整离线验收 **49 passed**。
+- [Day2：Recall@K、MRR 与召回诊断](week9.md#day2)；实现：[retrieval_metrics.py](retrieval_metrics.py)，测试：[test_week9_day2.py](../tests/test_week9_day2.py)。
+- Day2 指标与真实 Ollama 基线已验收；离线 **33 passed、1 skipped**，真实 30 题已记录，K=5 时平均 Recall 为 100%。版本/权限问题保留为后续优化基线，下一阶段为 Day3 Hybrid Search。
 
 本文件用于目录导航。Week7 学习内容维护在 `week7.md`，Week8 维护在 `langchain_learning/week8.md`，Week9 维护在 `week9.md`；各文档均按测试分别说明数据来源、目标和产物。
