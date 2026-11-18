@@ -2,7 +2,7 @@
 
 > 基准计划：`/home/xumaozhou/Music/agent_engineer_learning_plan_v4_mcp.md`。
 >
-> 当前进度（2026-11-17）：**Day1～Day3 已完成，下一阶段为 Day4：重排与 Context 组装**。Week7、Week8 已完成。
+> 当前进度（2026-11-18）：**Day1～Day4 已完成，下一阶段为 Day5 版本、状态与权限过滤**。Week7、Week8 已完成。
 >
 > 默认使用主项目 `.venv/bin/python`；实现放在 `rag/`，测试放在 `tests/`。
 
@@ -13,7 +13,7 @@
 | **Day1（已完成）** | 固定评估集，明确答案依据与拒答边界 | 30 道题、知识快照、运行输入与评分参考 |
 | **Day2（已完成）** | Recall@K、MRR 与召回错误分析 | 有分母的检索基线 |
 | **Day3（已完成）** | 关键词与向量结合的 Hybrid Search | 精确标识符与语义检索对照 |
-| Day4 | 重排、去重和 Context 预算 | 可追溯且集中的证据 |
+| **Day4（已完成）** | 重排、去重和 Context 预算 | 可追溯且集中的证据 |
 | Day5 | 生效版本、审核状态和访问权限过滤 | 版本与越权专项测试 |
 | Day6 | 检索、引用、回答、拒答分别评估 | 错误归因与人工复核 |
 | Day7 | 基础方案与优化方案对照 | 质量、成本与延迟报告 |
@@ -743,3 +743,285 @@ tests/test_week9_day3.py::test_real_ollama_three_strategy_comparison \
 准备阶段框架自检为 **19 passed、6 skipped**；完成两处计算后的 Day1～Day3 联合离线验收为 **106 passed、2 skipped**。
 默认模式仍跳过扩展验收，复验全部离线检查应开启对应 DAY 开关，并关闭各 MODEL 开关。
 真实 Ollama 对照不计入当前完成证据，后续可另行运行；主项目仍不调用回答型 LLM 完成本日检索。
+
+<a id="day4"></a>
+
+## Day4：重排、来源内去重与 Context 预算（已完成）
+
+### 完成记录（2026-11-18）
+
+| 验收 | 结果 |
+|---|---|
+| Day4 离线 | 34 项通过，2 项真实模型测试跳过 |
+| Ollama 检索，关闭重排 | 30/30 题完成，0 错误，前后 Context 一致。22 道可计分题平均 Context Recall 为 100%，MRR 为 0.9545 |
+| DeepSeek 真实重排 | 3/3 题完成，均调用评分，0 错误。2 道可计分题前后 Context Recall、MRR 均为 1.00，实时状态题不计分 |
+
+两组真实测试复用 Day2 的 70 个向量片段。完整 Context 的峰值估算为 2737，加上 256 的预留额后为 2993，符合 3000 的预算。
+提交前 Day1～Day4 离线联合回归为 140 项通过，4 项真实模型测试跳过。
+原文复核显示，`W9D1-01` 选入了直接解释 `import_std` 用途的片段，`W9D1-25` 同时选入了 1.0 和 2.0 版的具体交付规则。
+两题在重排前已覆盖参考文档组，所以来源组指标保持不变。`W9D1-18` 前后均把需要实时 API 的说明排在首位。
+
+重排收益目前有逐题证据，整体收益仍需更大配对样本。`W9D1-25` 重排后仍保留已撤销的 `KB021`。
+关闭重排的 30 题报告还记录了 `W9D1-26`、`W9D1-28`、`W9D1-30` 的越权来源 `KB019`，这些样例留作 Day5 过滤验收。
+真实报告分别保存在数据目录的 `runs/day4/local_model/` 与 `runs/day4/real_llm/`。
+
+### 今天学习什么
+
+Day3 负责找候选，今天负责从候选中选择要送给回答模型的证据。学习阶段只构建并检查 Context，
+不再次实现回答层，不修改通用 Agent 提示词。版本、草稿/失效状态与访问权限过滤留待 Day5。
+
+```mermaid
+flowchart TD
+    Q[问题与可信检索条件] --> R[Day3 Hybrid：最多 20 个候选]
+    R --> D[去重：相同来源和完整正文]
+    D --> B[原顺序：组装预算内 Context]
+    D --> S[可选重排：问题与候选正文评分]
+    S --> A[新顺序：组装同预算 Context]
+    B --> E[对照覆盖率、RR、预算和来源]
+    A --> E
+    A --> C[复用已有引用校验]
+```
+
+“先召回、再重排”的原理可参考 [Sentence Transformers 官方说明](https://www.sbert.net/examples/sentence_transformer/applications/retrieve_rerank/README.html)。
+常见实现使用 CrossEncoder；本练习将评分器作为可注入接口：离线注入固定分数，可选真实评分沿用项目已有 DeepSeek。
+这里没有安装 CrossEncoder、下载新模型，也不保证重排会提升效果；效果不明显可以关闭。
+
+| 学习内容 | 本日验收标准 |
+|---|---|
+| Rerank 与 Retrieval 的区别 | 能解释“重新评价已召回候选”，重排不能找回候选池外遗漏的来源 |
+| 分数和正文对齐 | 按评分排序候选下标，同分保持原序；保留原始检索分数与新增重排分数 |
+| 去重边界 | 同来源同正文只留首次；同文档不同正文、版本、章节或权限元数据分别保留 |
+| Context 预算 | 完整序列化证据与预留额一起判断；等值可放，长片段跳过后继续，不改写原文 |
+| 可追溯引用 | Context 保留文档/Chunk ID、版本、来源和定位；只允许引用实际选入的证据 |
+| 效果对照 | 同一候选池、同一预算比较前后 Context 来源组覆盖与 RR，保留分母、错误和遗漏 |
+
+“证据更集中”需要检查：重复是否减少、相关来源是否进入有限预算、是否遗漏必要的第二份证据。
+不能只看模型自己输出的相关性分数，也不能把程序执行成功当作语义质量通过。
+
+### 文件、输入输出与三个已完成的练习
+
+```text
+主项目/
+├── rag/reranking.py             # 重排、来源内去重与预算组装
+├── rag/week9.md                 # 本说明
+└── tests/test_week9_day4.py      # 测试完整，无需填写
+
+/media/xumaozhou/data/AI/local_agent_test/week9_rag_quality/
+├── manifest.json、knowledge/、eval_cases.json  # 原 Day1 冻结数据，不修改
+├── context_examples_day4.json   # 10 个合成命中，独立于 30 道评估题
+├── README_day4.md
+└── runs/day4/
+    ├── offline/context_report.json、context_report.md
+    ├── local_model/context_report.json、context_report.md
+    └── real_llm/context_report.json、context_report.md
+```
+
+合成反例中的 `synthetic/` 是内存来源标记，不是磁盘知识文件，不加入 manifest 或评估题分母。
+它包含超长背景、无关短文、相关解释、相同 ID 重复、同来源同正文的不同 ID，以及不同版本/章节/权限/文档的同文反例。
+30 题对照沿用 Day1 数据与 Day3 检索器；离线人工向量和固定评分只验证流程，不评价模型语义能力。
+
+| 练习 | 函数 | 已完成的关键步骤 |
+|---|---|---|
+| W9D4-1 | `rerank_hits`：输入校验、异步评分、复制和分数记录 | 根据 scores 对候选 indices 降序排序，同分保留原下标顺序 |
+| W9D4-2 | `deduplicate_hits`：来源身份、元数据身份、去重记录 | 组合包含来源、元数据、原始正文的可哈希 key |
+| W9D4-3 | `build_budgeted_context`：JSON 序列化、计数、续选与编号 | 判断本次候选总计数加预留额是否不超过 max_tokens |
+
+函数注释给出了输入、输出、边界和示例。
+
+```python
+# 评分器契约：只接收真实运行问题和候选正文，不接收 expected、标准答案或评分参考。
+async def score_pairs(question: str, texts: list[str]) -> list[float]:
+    # 返回值与 texts 等长、逐项对应，每项为 [0,1] 内有限数；可注入离线替身。
+    ...
+
+# 计数器契约：接收完整 Context JSON，返回非负整数。
+# 可以替换为模型 tokenizer；本日默认 estimate_tokens 只做字符估算。
+def count_tokens_fn(text: str) -> int:
+    ...
+```
+
+`JsonLLMReranker` 已提供候选 ID 校验：模型可以乱序返回 C1/C2，但不能遗漏、重复、增加候选，
+也不能返回解释或改写正文。最终排序仍由程序按返回分数完成；`None` 评分器表示关闭重排。
+原 `hit.score` 保持原检索含义，新增 `rerank_score` 不冒充余弦相似度。
+
+### 预算和报告中的数字如何理解
+
+- 默认 `max_tokens=3000`、`reserved_tokens=256`，计数器为 `(字符数 + 1) // 2`，报告明确标为估算。
+- 计数覆盖完整 Context JSON：编号、正文、定位和元数据均有开销。每次尝试完整追加一个片段，不裁剪正文。
+- `used_tokens` 是该计数器的结果；JSON 字段名不意味着模型实际使用了这些 Token。
+- 预留额仅作练习预算，不实际测量 system、问题、消息封装与输出长度，不能保证完整模型请求的实际 Token 上限。
+- 边界测试注入 `len`，使用名为 `character_fixture` 的字符代理，以便精确手算；实际接入 tokenizer 后需重新校准。
+- `Context Recall` 沿用 Day2 的参考来源组覆盖算法，在预算内 sources 上计算；不是答案支持性评分。
+- `before_rr/after_rr` 在预算截取前的候选顺序上计算；成功配对题目的均值才是 MRR。本日不混同候选 RR 与 Context Recall。
+- 先对两个分支共同去重，再比较原顺序与重排顺序，避免把去重收益误记为重排收益。
+- 未知/拒答题无参考来源组时指标为 `null`，原 30 题仍为 22 题适用、8 题不适用；执行错误单列阶段和类型，不伪造零分。
+- `provider_usage=null` 表示现有适配器没有提供实际 Token 用量；DeepSeek 在本日仅评分，不生成最终回答。
+
+报告 JSON 保存原候选、去重映射、重排后候选、两份完整 Context、因预算省略的 ID、指标和来源诊断。
+Markdown 提供配对分母、均值和逐题索引。可逐项检查同版本来源、原文引用和计数边界。
+来源元数据被保留不代表访问控制已接入；当前权限/失效来源问题仍记录在 diagnostics 中，留待 Day5 修复。
+
+### 测试一：样例来源与计数器
+
+- **函数**：`test_provided_fixture_is_separate_from_the_frozen_benchmark`。
+- **数据来源**：外部 `context_examples_day4.json`、原 30 道题，以及测试内中英文字符串。
+- **测试目标**：样例不混入题库，字符估算含奇数向上取整、空串和非法类型。
+- **输出与条件**：默认执行，仅 pytest 断言，不调用模型。
+
+### 测试二：关闭重排和空候选
+
+- **函数**：`test_provided_rerank_bypass_and_empty_input_never_score`。
+- **数据来源**：合成命中与禁止调用的异步替身。
+- **测试目标**：`None` 评分器保持顺序、返回独立副本；空候选不评分。
+- **输出与条件**：默认执行，仅 pytest 断言。
+
+### 测试三：评分数值校验
+
+- **函数**：`test_provided_invalid_scores_are_rejected_before_sorting`，6 个参数用例。
+- **数据来源**：缺失分数、布尔、NaN、负数、超过 1 的数值。
+- **测试目标**：排序前检查评分是否等长且为合法有限数。
+- **输出与条件**：默认执行，仅 pytest 断言。
+
+### 测试四：同 ID 来源冲突
+
+- **函数**：`test_provided_duplicate_id_with_conflicting_content_is_rejected`。
+- **数据来源**：相同 Chunk ID 配不同正文的合成反例。
+- **测试目标**：先报来源冲突，不把被改写的来源静默去重。
+- **输出与条件**：默认执行，仅 pytest 断言。
+
+### 测试五：非法预算
+
+- **函数**：`test_provided_invalid_budget_configuration_is_rejected`，6 个参数用例。
+- **数据来源**：零/布尔预算、负预留额、预留超限、非计数器、空计数器名。
+- **测试目标**：预算配置在处理正文前失败。
+- **输出与条件**：默认执行，仅 pytest 断言。
+
+### 测试六：空 Context 与计数器返回值
+
+- **函数**：`test_provided_empty_context_and_invalid_counter`。
+- **数据来源**：空候选和返回负数/布尔/小数的计数器。
+- **测试目标**：空 Context 使用量为 0；计数结果必须为非负整数。
+- **输出与条件**：默认执行，仅 pytest 断言。
+
+### 测试七：评分响应 ID 对齐与输入隔离
+
+- **函数**：`test_provided_json_scorer_aligns_ids_without_gold_or_source_paths`。
+- **数据来源**：乱序返回 C2/C1 的 JSON 替身、含命令式文本的候选。
+- **测试目标**：按 ID 对齐分数，输入仅含问题与候选正文，正文命令作为数据传入。
+- **输出与条件**：默认执行，内存调用记录；不据此声称真实模型抗注入已通过。
+
+### 测试八：非法 JSON 评分响应
+
+- **函数**：`test_provided_json_scorer_rejects_malformed_or_unaligned_responses`，6 个参数用例。
+- **数据来源**：非 JSON、缺字段、未知/重复 ID、布尔分数、额外解释字段。
+- **测试目标**：拒绝不完整或无法对齐的模型输出，不静默回退或补分。
+- **输出与条件**：默认执行，仅 pytest 断言。
+
+### 测试九：评分输入上限
+
+- **函数**：`test_provided_json_scorer_limits_input_before_model_call`，4 个参数用例。
+- **数据来源**：空列表、空正文、21 个候选、超过 20000 字符的候选。
+- **测试目标**：输入不合法时禁止模型调用，不静默裁剪候选。
+- **输出与条件**：默认执行，仅 pytest 断言。
+
+### 测试十：配对指标分母
+
+- **函数**：`test_provided_summary_uses_the_same_successful_pair_denominator`。
+- **数据来源**：一题成功、一题不适用、一题执行错误的手写报告行。
+- **测试目标**：均值使用相同成功配对，保留计划分母、错误数，不适用不记满分。
+- **输出与条件**：默认执行，仅 pytest 断言。
+
+### 测试十一：重排下标、同分与原分数
+
+- **函数**：`test_rerank_sorts_aligned_candidates_stably_and_preserves_raw_scores`。
+- **数据来源**：合成候选与分数 `[0.1, 0.9, 0.9]`。
+- **测试目标**：顺序为 `[1,2,0]`；保留原分数、原文和独立副本，拒绝未去重的 ID。
+- **输出与条件**：开启 DAY4，pytest 断言。
+
+### 测试十二：来源内去重边界
+
+- **函数**：`test_dedup_keeps_distinct_evidence_versions_sections_and_scopes`。
+- **数据来源**：全部 10 个合成命中。
+- **测试目标**：删除两条重复并记录原因；保留不同正文、版本、章节、权限和文档，输入不被修改。
+- **输出与条件**：开启 DAY4，返回 8 个独立证据与两条去重记录。
+
+### 测试十三：完整 JSON 预算与长片段续选
+
+- **函数**：`test_budget_counts_full_json_reserves_space_and_continues_after_long_chunk`。
+- **数据来源**：超长背景、两条短文，测试独立计算 JSON 字符预算并预留 37。
+- **测试目标**：跳过长片段后继续，等值边界可放，少 1 则拒绝，重复 ID 不占空间，编号连续。
+- **输出与条件**：开启 DAY4，内存 BudgetedContext，计数方法标为字符代理。
+
+### 测试十四：只引用实际选入证据
+
+- **函数**：`test_citations_resolve_only_to_selected_context_with_original_metadata`。
+- **数据来源**：预算选出的目标片段与测试内 RagAnswer。
+- **测试目标**：既有 `validate_answer` 能解析原来源；不存在的编号和省略片段原文不能通过。
+- **输出与条件**：开启 DAY4，检查引用结构和摘录。
+
+### 测试十五：执行失败定位
+
+- **函数**：`test_runner_records_failure_stage_without_fabricating_scores`。
+- **数据来源**：冻结知识的真实分块，以及抛 ValueError 的评分替身。
+- **测试目标**：记录 rerank 阶段、异常类型、空指标和零成功配对，不保存异常正文或伪造分数。
+- **输出与条件**：开启 DAY4，pytest 临时目录中的 `context_report.json/md`。
+
+### 测试十六：30 题离线前后对照
+
+- **函数**：`test_offline_thirty_case_context_comparison_has_no_gold_in_runtime`。
+- **数据来源**：Day1 原知识/题库、固定二维向量和固定正文评分规则。
+- **测试目标**：检索只接收纯 input，评分不接收 gold；30 题完整记录，22/8 分母正确，两份 Context 均受相同预算约束。
+- **输出与条件**：开启 DAY4，产物 `runs/day4/offline/context_report.json/md`。人工评分用于验证流程。
+
+### 测试十七：真实 Ollama 与关闭重排
+
+- **函数**：`test_real_ollama_context_budget_without_remote_reranking`。
+- **数据来源**：原 30 题和已有 `qwen3-embedding:0.6b`，优先加载 Day2 的冻结索引。
+- **测试目标**：真实检索可连接，来源与预算完整，关闭评分时两条路径输出相同。
+- **输出与条件**：同时开启 DAY4、MODEL，产物 `runs/day4/local_model/context_report.json/md`，不调用远程 LLM。
+
+### 测试十八：DeepSeek 三题真实重排
+
+- **函数**：`test_real_deepseek_reranks_three_cases_with_the_same_context_budget`。
+- **数据来源**：W9D1-01 普通题、25 跨版本题、18 实时未知题；Ollama 候选和已有 DeepSeek 配置。
+- **测试目标**：真实评分 ID/数值合法、前后同预算可比、错误可定位；不预设指标提升。
+- **输出与条件**：同时开启 DAY4、MODEL、LLM，产物 `runs/day4/real_llm/context_report.json/md`。模型仅评分，不生成回答。
+
+### 运行命令
+
+在主项目根目录运行基础自检：
+
+```bash
+.venv/bin/python -B -m pytest tests/test_week9_day4.py -q -p no:cacheprovider
+```
+
+运行完整离线验收：
+
+```bash
+RUN_WEEK9_DAY4=1 RUN_WEEK9_DAY4_MODEL=0 RUN_WEEK9_DAY4_LLM=0 \
+.venv/bin/python -B -m pytest tests/test_week9_day4.py -v -s -p no:cacheprovider
+```
+
+可选真实 Ollama 检索与预算测试（先启动本地服务，不需要远程 Key）：
+
+```bash
+RUN_WEEK9_DAY4=1 RUN_WEEK9_DAY4_MODEL=1 RUN_WEEK9_DAY4_LLM=0 \
+.venv/bin/python -B -m pytest \
+tests/test_week9_day4.py::test_real_ollama_context_budget_without_remote_reranking \
+-v -s -p no:cacheprovider
+```
+
+可选真实重排（沿用已配置的 DeepSeek 环境变量，不在命令或文档填写密钥）：
+
+```bash
+RUN_WEEK9_DAY4=1 RUN_WEEK9_DAY4_MODEL=1 RUN_WEEK9_DAY4_LLM=1 \
+.venv/bin/python -B -m pytest \
+tests/test_week9_day4.py::test_real_deepseek_reranks_three_cases_with_the_same_context_budget \
+-v -s -p no:cacheprovider
+```
+
+可选路径：`WEEK9_RAG_DATASET`、`WEEK9_DAY4_OUTPUT`、`WEEK9_DAY4_INDEX`。
+真实检索优先使用 `runs/day2/local_model/index/`，若不存在则在 Day4 独立目录建库。
+已有索引仍由原配置/fingerprint 校验；不会覆盖 Day2、Day3 报告。
+
+单独复跑某一种真实测试时，选择对应的 pytest 入口。完成记录见本节开头。
