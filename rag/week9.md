@@ -2,7 +2,7 @@
 
 > 基准计划：`/home/xumaozhou/Music/agent_engineer_learning_plan_v4_mcp.md`。
 >
-> 当前进度（2026-11-18）：**Day1～Day5 已完成，下一阶段为 Day6 输出评估与错误归因**。Week7、Week8 已完成。
+> 当前进度（2026-11-18）：**Day1～Day6 已完成，下一阶段为 Day7 周验收**。Week7、Week8 已完成。
 >
 > 默认使用主项目 `.venv/bin/python`；实现放在 `rag/`，测试放在 `tests/`。
 
@@ -15,7 +15,7 @@
 | **Day3（已完成）** | 关键词与向量结合的 Hybrid Search | 精确标识符与语义检索对照 |
 | **Day4（已完成）** | 重排、去重和 Context 预算 | 可追溯且集中的证据 |
 | **Day5（已完成）** | 生效版本、审核状态和访问权限过滤 | 版本与越权专项测试 |
-| Day6 | 检索、引用、回答、拒答分别评估 | 错误归因与人工复核 |
+| **Day6（已完成）** | 检索、引用、回答、拒答分别评估 | 错误归因与人工复核 |
 | Day7 | 基础方案与优化方案对照 | 质量、成本与延迟报告 |
 
 <a id="day1"></a>
@@ -1150,3 +1150,139 @@ tests/test_week9_day5.py::test_real_ollama_filters_thirty_cases_before_context \
 ```
 
 可通过 `WEEK9_RAG_DATASET`、`WEEK9_DAY5_OUTPUT` 和 `WEEK9_DAY5_INDEX` 指定目录。真实检索结果见本节完成记录。
+
+<a id="day6"></a>
+
+## Day6 RAG 输出评估与错误归因（已完成）
+
+### 完成记录（2026-11-18）
+
+Day6 离线验收 18 项通过。提交前 Day1～Day6 联合离线回归 176 项通过，6 项真实模型测试按开关跳过。
+真实 Ollama 与 DeepSeek 评估记录 6 题，0 执行异常。逐题复核后 **5 题通过、1 题失败**。两道应答题的引用与必要要点通过，三道拒答题的理由通过。原始报告、复核备注与合并报告保存在外部数据目录 `runs/day6/real_model/`。
+
+唯一失败为跨版本题 `W9D1-25`，预期回答两个版本的交付规则，实际拒答。1.0 版关键段落 `KB003:body:0002` 排在候选第 6 位，被 Context 预算省略。Context 仍含 1.0 版标题和版本说明，所以文档组召回为 100%。模型基于收到的证据拒答合理，根因是 **Context 漏选关键片段**，自动记录的 `answer_status_error` 是下游结果。
+
+用 Day4 保存的分数离线重放 Day6 的 16 条合规候选，同一估算预算下，两条参考原文的覆盖从 1/2 增至 2/2，总占用加预留额为 2967/3000。这次回放验证了证据能够同批选入，继续作为 Day7 真实对照的线索。
+
+Day5 解决了哪些片段可以进入检索。Day6 要解释输出哪里出错。比如，跨版本题只答了 1.0，有可能根本没有召回 2.0，有可能 Context 预算把 2.0 排除了，也有可能模型看到了 2.0 却漏答。每种情况对应不同的检查。
+
+| 检查 | 验收目标 |
+|---|---|
+| 检索与 Context | 分别计算目标文档组的覆盖率。检索本身未覆盖全组时，记录检索遗漏，Context 归因项保持 `null` |
+| 输出结构与引用 | 区分模型调用错误、JSON 格式错误、引用编号错误、逐字摘录错误。只有实际进入 Context 的原文可作为引用 |
+| 主张支持与回答完整性 | 人工核对每条主张是否有证据，以及是否覆盖题库的必要答案点 |
+| 拒答 | 程序比较 `answered` / `insufficient` 状态。对正确拒答的题，再人工检查缺什么材料或为什么需要实时 API |
+| 报告 | 每项分别保留通过、失败和未检查数，能从失败标签追溯到候选、Context、回答或人工说明 |
+
+### 代码、数据与关键判断
+
+- [output_evaluation.py](output_evaluation.py) 复用 Day5 Retriever、Day4 去重与预算组装、Week7 的回答结构和引用校验。整体顺序是检索 → 候选资格复核 → Context → 回答 → 自动检查 → 人工复核。
+- [test_week9_day6.py](../tests/test_week9_day6.py) 已提供。数据沿用外部目录 `/media/xumaozhou/data/AI/local_agent_test/week9_rag_quality/` 的 30 道固定题、清单和原知识。反例从同一清单取片段，测试中注入假回答或超时。
+- `collect_trace` 收到的是 `case.input` 与可信清单。生成器只收到既有系统规则、问题、合规证据。评分参考用于结果记录后的评分。恶意引用的编号与摘录单独校验，语义支持和完整性由人工检查。
+
+两处练习位于 `grade_trace`。
+
+| 练习 | 输入 | 应得结果 |
+|---|---|---|
+| `W9D6-1` | `retrieval_ok` 与 `context_recall` | 只有检索覆盖全组且 Context 已构建，才检查 Context 是否漏组。检索 0.5、Context 0.5 时返回 `None`。检索 1.0、Context 0.5 时返回 `False` |
+| `W9D6-2` | `errors`、适用的复核字段 `applies`、人工结果 `review` | 有错误返回 `failed`。无错误且存在适用项未填返回 `needs_review`。检查和适用人工项齐全且通过时返回 `passed` |
+
+进入第二处判断时，`automatic_passed` 已记录自动检查是否通过，`errors` 则汇集了自动和人工的失败标签。
+`applies` 是本题需要复核的字段名。比如应答题只检查 `claims_supported` 和 `answer_complete`，这两项都为 `true` 就能通过，空着的 `refusal_reason_ok` 不参与判断。若其中一项为 `false`，另一项留空，结果仍是 `failed`。
+
+`retrieval_recall` 与 `context_recall` 都保留原值，即使 Context 漏失的归因暂不适用。格式与引用检查通过后，模型仍可能引用正确原句却得出错误结论，也可能漏答一个版本。人工表分别记录这两种情况。
+
+### 测试一：结构、引用和调用阶段
+
+- **函数**为 `test_provided_trace_separates_format_reference_and_execution`。
+- **数据来源**是 `W9D1-09`、`KB012` 的原文和五组生成器替身。
+- **测试目标**为核对模型输入未携带评分参考，区分正确输出、非法 JSON、未知编号、伪造摘录与超时。默认执行，输出 pytest 断言。
+
+### 测试二：空候选与不合规来源
+
+- **函数**为 `test_provided_empty_or_disallowed_candidates_never_reach_generator`。
+- **数据来源**是未知版本题，以及故意混入 `KB019`、`KB020`、`KB021` 的检索替身。
+- **测试目标**为生成前识别无证据和候选资格异常。空 Context 直接给出信息不足，越权或失效片段只记录违规 ID。默认执行，输出 pytest 断言。
+
+### 测试三：检索漏失与 Context 漏失
+
+- **函数**为 `test_one_missing_version_is_attributed_to_the_right_stage`。
+- **数据来源**是跨版本题 `W9D1-25` 的两份有效证据和刚够一份证据的预算。
+- **测试目标**为区分检索召回 0.5 与检索召回 1.0 后 Context 降到 0.5。启用 Day6 后执行，输出分阶段错误标签断言。
+
+### 测试四：Context 构建失败与空结果
+
+- **函数**为 `test_context_build_error_and_empty_context_have_different_tags`。
+- **数据来源**是已经检索到的 `KB012` 证据，以及非法预算和只能构建空 Context 的合法预算。
+- **测试目标**为构建异常只记录 `context_build_error`，成功构建的空 Context 在检索找齐时记录 `context_miss`。启用 Day6 后执行，输出阶段归因断言。
+
+### 测试五：有效引用与人工语义检查
+
+- **函数**为 `test_valid_quote_can_still_support_an_incomplete_or_incorrect_answer`。
+- **数据来源**是 `W9D1-09` 正确原文和两个结构合法的假回答，分别漏答必要项和加入原文未支持的期限。
+- **测试目标**为自动检查可通过但仍待复核，支持性与完整性分别归因。启用 Day6 后执行，输出人工项和状态断言。
+
+### 测试六：合理拒答及理由
+
+- **函数**为 `test_refusal_checks_distinguish_status_and_reason`。
+- **数据来源**是实时任务状态题 `W9D1-18`、静态知识和人工判断样例。
+- **测试目标**为拒答题无目标组时两个召回均为 `null`，状态正确仍要检查是否说明需要实时 API。启用 Day6 后执行。
+
+### 测试七：生成故障
+
+- **函数**为 `test_model_failure_never_rewrites_as_refusal`。
+- **数据来源**是检索到静态说明的实时问题，以及抛出异常的生成器。
+- **测试目标**为调用故障记录 `generation_error`，回答状态未检查，最终为失败。启用 Day6 后执行。
+
+### 测试八：人工复核合并
+
+- **函数**为 `test_partial_manual_review_is_bound_to_the_original_execution`。
+- **数据来源**是一答一拒两条执行记录，填写其中一条复核，然后模拟原报告被替换。
+- **测试目标**为允许部分复核，拒绝过期的复核文件，分别保存原报告与复核后报告。启用 Day6 后执行，产物位于 pytest 临时目录。
+
+### 测试九：30 题完整离线评估
+
+- **函数**为 `test_offline_thirty_cases_record_separate_dimensional_counts`。
+- **数据来源**是冻结 30 题、人工向量索引和总是输出信息不足的生成器。
+- **测试目标**为记录 30 行与分项计数，22 道应答题故意触发状态错误，8 道拒答题等待复核。人工回答仅用于验证归因。启用 Day6 后输出到 `runs/day6/offline/`。
+
+### 测试十：真实 Ollama 与 DeepSeek 输出
+
+- **函数**为 `test_real_ollama_and_deepseek_record_six_cases_for_review`。
+- **数据来源**是固定题库的 `09`、`17`、`18`、`25`、`27` 和 `28` 六题，覆盖歧义、未知版本、实时状态、跨版本和权限边界。Ollama 优先加载 Day2 索引。
+- **测试目标**为四个运行阶段可追溯，合规证据进入回答，模型格式或引用错误保留在报告中供分析。真实测试通过后仍需按题核对支持性、完整性与拒答理由。启用两个开关后输出到 `runs/day6/real_model/`。
+
+### 运行与人工复核
+
+运行基础自检。
+
+```bash
+.venv/bin/python -B -m pytest tests/test_week9_day6.py -q -p no:cacheprovider
+```
+
+运行完整离线验收。
+
+```bash
+RUN_WEEK9_DAY6=1 RUN_WEEK9_DAY6_REAL=0 \
+.venv/bin/python -B -m pytest tests/test_week9_day6.py -v -s -p no:cacheprovider
+```
+
+可选真实评估，使用已启动的 Ollama 和已配置的 DeepSeek 环境。
+
+```bash
+RUN_WEEK9_DAY6=1 RUN_WEEK9_DAY6_REAL=1 \
+.venv/bin/python -B -m pytest \
+tests/test_week9_day6.py::test_real_ollama_and_deepseek_record_six_cases_for_review \
+-v -s -p no:cacheprovider
+```
+
+报告产物为 `evaluation_report.json`、`evaluation_report.md` 和 `reviews_template.json`。
+阅读原报告的 `trace.context`、`trace.answer` 与 `expected`。复制模板并保留 `report_sha256`，按每题 `review_applicable` 填 `true` 或 `false`。其余字段留 `null`，失败项在 `notes` 记录原因。允许一次只填写部分题。
+
+```bash
+.venv/bin/python -B -m rag.output_evaluation \
+  /path/to/evaluation_report.json /path/to/reviews.json
+```
+
+合并后在原运行目录生成 `reviewed_report.json` 与 `reviewed_report.md`。
+可通过 `WEEK9_RAG_DATASET`、`WEEK9_DAY6_OUTPUT` 和 `WEEK9_DAY6_INDEX` 指定路径。
