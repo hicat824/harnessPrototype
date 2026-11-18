@@ -27,7 +27,7 @@ Week7 Day1～Day7 已完成，完整学习内容已汇总到 [week7.md](week7.md
 - [Day7：原生 Python 与 LangChain RAG 对照周验收（已完成）](../langchain_learning/week8.md#day7)
 - Day7 实现：[comparison.py](comparison.py)，测试：[test_week8_day7.py](../tests/test_week8_day7.py)。
 
-## Week9：RAG 质量优化与评估（Day1～Day6 已完成）
+## Week9：RAG 质量优化与评估（已完成）
 
 - [Day1：固定评估集、参考证据与输入隔离](week9.md#day1)。
 - 实现：[eval_dataset.py](eval_dataset.py)，测试：[test_week9_day1.py](../tests/test_week9_day1.py)。
@@ -42,6 +42,8 @@ Week7 Day1～Day7 已完成，完整学习内容已汇总到 [week7.md](week7.md
 - [Day5：版本、状态与权限过滤（已完成）](week9.md#day5)。实现见 [knowledge_policy.py](knowledge_policy.py)，测试见 [test_week9_day5.py](../tests/test_week9_day5.py)。
 - Day5 真实 Ollama 对照中，候选和 Context 含不合规来源的题数均从 4 降到 0，22 道可计分题的 Context Recall 保持 100%。
 - [Day6 RAG 输出评估与错误归因（已完成）](week9.md#day6)。实现见 [output_evaluation.py](output_evaluation.py)，测试见 [test_week9_day6.py](../tests/test_week9_day6.py)。
-- Day6 真实复核 5 题通过、1 题失败。跨版本题的失败已定位为 Context 漏选关键片段，下一阶段为 Day7 周验收。
+- Day6 真实复核 5 题通过、1 题失败。跨版本题的失败已定位为 Context 漏选关键片段。
+- [Day7 质量、用量与延迟对照（已完成）](week9.md#day7)。实现见 [quality_comparison.py](quality_comparison.py)，测试见 [test_week9_day7.py](../tests/test_week9_day7.py)。
+- Day7 新一轮真实复核为基线 5/6、重排 6/6。跨版本用例受益，重排保留为可选能力。[本周小结](week9.md#week9-summary)。
 
 本文件用于目录导航。Week7 学习内容维护在 `week7.md`，Week8 维护在 `langchain_learning/week8.md`，Week9 维护在 `week9.md`；各文档均按测试分别说明数据来源、目标和产物。

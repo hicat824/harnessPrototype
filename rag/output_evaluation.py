@@ -11,7 +11,7 @@ import time
 from rag.answering import ContextBundle, RagAnswer, build_messages, validate_answer
 from rag.eval_dataset import build_case_input, load_benchmark, reference_is_eligible, validate_benchmark
 from rag.preprocessing import read_manifest
-from rag.reranking import build_budgeted_context, deduplicate_hits
+from rag.reranking import ScorePairs, build_budgeted_context, deduplicate_hits, rerank_hits
 from rag.retrieval_metrics import _validate_hits, recall_at_k
 
 
@@ -30,12 +30,14 @@ CHECK_TAGS = {
 
 
 async def collect_trace(request: dict, retrieve, generate, documents: dict, *, candidate_k: int = 20,
-                        max_tokens: int = 3000, reserved_tokens: int = 256) -> dict:
+                        max_tokens: int = 3000, reserved_tokens: int = 256,
+                        score_pairs: ScorePairs | None = None) -> dict:
     """已提供：用 case.input 运行检索和回答，记录阶段与实参。
 
     retrieve(request, k) 返回标准命中，generate(messages) 异步返回 JSON 正文。
     documents 是可信 manifest 按 doc_id 建立的映射。送生成前复核候选资格，
     违规只记文档 ID 并结束。空 Context 直接生成结构化 insufficient。
+    score_pairs 可选，合规候选去重后、组装 Context 前评分并重新排序。
     结果中的 None 表示阶段未执行或检查不适用，异常只记录阶段和类型。
     """
     trace = dict(retrieved_hits=None, policy_ok=None, rejected_doc_ids=[], context=None,
@@ -58,6 +60,11 @@ async def collect_trace(request: dict, retrieve, generate, documents: dict, *, c
 
         stage = 'context'
         unique, _ = deduplicate_hits(hits)
+        if score_pairs is not None and unique:
+            stage = 'rerank'
+            unique = await rerank_hits(request['question'], unique, score_pairs)
+            trace['reranked_hits'] = copy.deepcopy(unique)
+        stage = 'context'
         context = build_budgeted_context(unique, max_tokens=max_tokens, reserved_tokens=reserved_tokens).context
         trace['context'] = asdict(context)
         if context.sources:
@@ -137,6 +144,7 @@ def grade_trace(trace: dict, expected: dict, review: dict | None = None) -> dict
     if trace['execution_error']:
         stage = trace['execution_error']['stage']
         stage_tags = {'retrieval': 'retrieval_execution_error', 'policy': 'ineligible_source',
+                      'rerank': 'rerank_error',
                       'context': 'context_build_error', 'generation': 'generation_error',
                       'answer_format': 'answer_format_error', 'citation': 'citation_error'}
         errors.append(stage_tags[stage])
@@ -186,7 +194,7 @@ def _write_report(path: Path, report: dict) -> bytes:
     report['summary'] = _summarize(report['rows'])
     raw = (json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + '\n').encode('utf-8')
     path.write_bytes(raw)
-    lines = ['# Week9 Day6 RAG 输出评估', '', f"运行模式为 `{report['mode']}`。", '',
+    lines = [f"# {report.get('title', 'Week9 Day6 RAG 输出评估')}", '', f"运行模式为 `{report['mode']}`。", '',
              '| 检查项 | 通过 | 失败 | 未检查 | 不适用 |', '|---|---:|---:|---:|---:|']
     summary = report['summary']
     for name, check in {**summary['automatic'], **summary['manual']}.items():
@@ -201,6 +209,16 @@ def _write_report(path: Path, report: dict) -> bytes:
                      f"{', '.join(grade['error_tags']) or '-'} |")
     path.with_suffix('.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
     return raw
+
+
+def write_evaluation_report(output: Path, report: dict) -> None:
+    """保存原始执行报告及与本轮原始字节绑定的人工复核模板。"""
+    output.mkdir(parents=True, exist_ok=True)
+    raw = _write_report(output / 'evaluation_report.json', report)
+    templates = [dict(case_id=row['case_id'], **row['assessment']['review']) for row in report['rows']]
+    template = dict(report_sha256=hashlib.sha256(raw).hexdigest(), reviews=templates)
+    (output / 'reviews_template.json').write_text(json.dumps(template, ensure_ascii=False, indent=2) + '\n',
+                                               encoding='utf-8')
 
 
 async def run_output_evaluation(dataset_dir, retrieve, generate, output_dir, *,
@@ -222,7 +240,7 @@ async def run_output_evaluation(dataset_dir, retrieve, generate, output_dir, *,
                                  or len(set(case_ids)) != len(case_ids)):
         raise ValueError('case_ids 需要是已知且不重复的用例')
     documents = {doc['doc_id']: doc for doc in read_manifest(root)}
-    rows, templates = [], []
+    rows = []
     for case_id in cases if case_ids is None else case_ids:
         case = cases[case_id]
         trace = await collect_trace(build_case_input(case), retrieve, generate, documents)
@@ -230,13 +248,8 @@ async def run_output_evaluation(dataset_dir, retrieve, generate, output_dir, *,
         grade = grade_trace(trace, expected)
         rows.append(dict(case_id=case_id, category=case['category'], input=copy.deepcopy(case['input']),
                          expected=expected, trace=trace, assessment=grade))
-        templates.append(dict(case_id=case_id, **grade['review']))
-    output.mkdir(parents=True, exist_ok=True)
     report = dict(mode=mode, dataset_fingerprint=snapshot['fingerprint'], rows=rows)
-    raw = _write_report(output / 'evaluation_report.json', report)
-    template = dict(report_sha256=hashlib.sha256(raw).hexdigest(), reviews=templates)
-    (output / 'reviews_template.json').write_text(json.dumps(template, ensure_ascii=False, indent=2) + '\n',
-                                               encoding='utf-8')
+    write_evaluation_report(output, report)
     return report
 
 

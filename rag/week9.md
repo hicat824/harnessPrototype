@@ -2,7 +2,7 @@
 
 > 基准计划：`/home/xumaozhou/Music/agent_engineer_learning_plan_v4_mcp.md`。
 >
-> 当前进度（2026-11-18）：**Day1～Day6 已完成，下一阶段为 Day7 周验收**。Week7、Week8 已完成。
+> 当前进度（2026-11-18）：**Week9 Day1～Day7 已完成，下一阶段为 Week10 Tool + RAG 协同**。Week7、Week8 已完成。
 >
 > 默认使用主项目 `.venv/bin/python`；实现放在 `rag/`，测试放在 `tests/`。
 
@@ -16,7 +16,7 @@
 | **Day4（已完成）** | 重排、去重和 Context 预算 | 可追溯且集中的证据 |
 | **Day5（已完成）** | 生效版本、审核状态和访问权限过滤 | 版本与越权专项测试 |
 | **Day6（已完成）** | 检索、引用、回答、拒答分别评估 | 错误归因与人工复核 |
-| Day7 | 基础方案与优化方案对照 | 质量、成本与延迟报告 |
+| **Day7（已完成）** | 基础方案与优化方案对照 | 质量、用量与延迟报告 |
 
 <a id="day1"></a>
 
@@ -1286,3 +1286,152 @@ tests/test_week9_day6.py::test_real_ollama_and_deepseek_record_six_cases_for_rev
 
 合并后在原运行目录生成 `reviewed_report.json` 与 `reviewed_report.md`。
 可通过 `WEEK9_RAG_DATASET`、`WEEK9_DAY6_OUTPUT` 和 `WEEK9_DAY6_INDEX` 指定路径。
+
+<a id="day7"></a>
+
+## Day7 周验收与方案对照（已完成）
+
+### 完成记录（2026-11-18）
+
+Day7 离线验收 10 项通过，完整记录 30 道配对题和 60 条执行明细。提交前 Week9 与共用回答层的离线回归共 233 项通过，9 项真实模型测试按开关跳过。
+两轮真实对照均使用同一批 6 道题，执行异常为 0。
+
+| 真实复核结果 | 基线 | 开启重排 |
+|---|---:|---:|
+| 第一轮通过数 | 5/6 | 5/6 |
+| 收紧回答提示词后通过数 | 5/6 | 6/6 |
+| 新一轮关键摘录平均覆盖（5 道适用题） | 70% | 80% |
+| 新一轮平均每题耗时 | 1.26 秒 | 2.34 秒 |
+| 新一轮平均每题实际 Token | 1998.8 | 3240.3 |
+
+- `W9D1-25` 两轮均从基线失败变为重排通过。原顺序没有把 1.0 的具体交付条款组装进 Context，重排后 1.0 和 2.0 的参考摘录均命中，证据覆盖从 0.5 到 1.0。
+- `W9D1-18` 第一轮重排答复的拒答理由正确，状态却填成了 `answered`。收紧提示词后，两路均返回 `insufficient`、空 `claims`，并在 `missing_information` 说明需要实时 API。重排 Context 也随两轮评分变化，无法单独量化提示词对结果的贡献。
+- 本批次平均每题增加 1.08 秒和 1241.5 Token。保留按需重排能力，优先用于跨版本等需要多份证据的题目。全面开启的收益仍待扩大样本验证。
+
+第一轮复核为外部数据目录的 `runs/day7/real_model/reviewed_comparison_report.md`。新一轮原始快照与复核保存在同目录的 `review_4baf4417/`。
+
+本日用成对实验验证一个问题：Day6 已有混合检索、权限过滤和 Context 预算，再加重排，证据覆盖和回答质量是否值得为此多付出一次模型调用。
+
+| 方案 | 执行步骤 |
+|---|---|
+| `baseline` | Day5 合规混合检索 → 去重 → Context → 回答 |
+| `rerank` | 同一批合规候选 → 去重 → Day4 重排 → 相同预算的 Context → 同一模型回答 |
+
+每题只检索一次。两路都使用最多 20 个候选、3000 的估算预算和 256 的预留额。框架记录数据指纹、索引信息、模型、候选数与预算，两路交替先跑，减少固定先后顺序的影响。重排输入只包含问题与合规候选正文。评分参考在执行后使用。
+
+### 两个已完成的判断
+
+| 位置 | 前序变量和约定 | 结果 |
+|---|---|---|
+| `W9D7-1` | `reference` 是一条评分摘录，含 `doc_id`、`segment_id`、`quote`。`chunks` 是被评估阶段实际取得的片段，`text` 是正文 | `found` 表示当前摘录是否命中。同文档、同正文单元且包含完整摘录才命中，一条摘录最多计一次 |
+| `W9D7-2` | `values` 中每项是同一道题的 `(baseline, rerank)`。任一侧为 `None` 说明缺测或不适用，`0` 是可参与计算的值 | `differences` 只保留双侧有值的题，每项为重排减基线。用列表长度作为分母 |
+
+位置都在 [quality_comparison.py](quality_comparison.py)，完整 [测试代码](../tests/test_week9_day7.py) 已提供。例如，跨版本题两份参考里只选到一份原文，覆盖是 0.5。题库没有参考摘录时是 `None`。假如三题的观测依次是 `(0, 1)`、`(1, None)` 和 `(1, 0.5)`，配对分母为 2，平均变化为 +0.25。
+
+### 验收目标与产物
+
+- **质量**分开记录文档组指标、片段级摘录覆盖、引用、回答状态与人工复核。用 `W9D1-25` 检查两版本的具体交付条款是否都选入，不能只看文档组召回。
+- **用量**分开记录回答和重排的模型调用次数与服务端实际返回的 `total_tokens`。某次调用没返回用量时，该方案的该题 Token 总量为 `null`。完全未调用模型时为 0。估算 Context 容量与计费用量分别保存。
+- **延迟**使用共享检索耗时加各路后续执行耗时，只聚合两路都完成的用例。失败分支保留原始耗时和阶段。串行小样本耗时用于观察附加调用开销。
+- **配对**各指标给出有效题数及重排减基线的均值。逐题保留分支状态和错误标签，语义仍待人工复核时显示 `needs_review`。重排即使没有收益，对照流程仍能正常产出结果。
+
+数据沿用外部目录 `/media/xumaozhou/data/AI/local_agent_test/week9_rag_quality/`。完整离线使用全部 30 题，真实验收抽取 Day6 的相同 6 题，优先复用 Day2 索引。产物位于 `runs/day7/offline/` 或 `runs/day7/real_model/`。
+
+| 文件 | 内容 |
+|---|---|
+| `evaluation_report.json/md` | 两路逐题明细，含原始候选、Context、回答、分项检查及调用记录 |
+| `comparison_report.json/md` | 一题一行，质量、用量和延迟的配对汇总 |
+| `reviews_template.json` | 按 `题号__baseline` 与 `题号__rerank` 分别复核，本轮哈希绑定到原报告 |
+| `reviewed_report.json/md`、`reviewed_comparison_report.json/md` | 合并复核后的明细和配对汇总 |
+
+### 测试一：区分缺测与不适用的摘录覆盖
+
+- **函数**为 `test_provided_evidence_coverage_skips_inapplicable_and_unexecuted_stages`。
+- **数据来源**是空参考和没有阶段输出的最小样例。
+- **检查与产物**为两种情形返回 `None`。默认执行，输出 pytest 断言。
+
+### 测试二：不合规候选拦截
+
+- **函数**为 `test_provided_policy_validation_runs_before_both_model_calls`。
+- **数据来源**是原清单的 `KB019` 和未授权题 `W9D1-28`。
+- **检查与产物**为策略阶段拒绝受限候选，两种模型调用均被阻止。默认执行。
+
+### 测试三：实际 Token 用量读取
+
+- **函数**为 `test_provided_deepseek_preserves_actual_usage_and_resets_when_absent`。
+- **数据来源**是 MockTransport 响应，依次提供真实零值、非零值、缺失值和非法布尔值。
+- **检查与产物**为实际用量按次保留，缺失时为 `None`。默认执行，无真实请求。
+
+### 测试四：参考摘录的三项匹配
+
+- **函数**为 `test_exact_evidence_requires_correct_source_unit_and_quote`。
+- **数据来源**是同文档异单元、错文档同字句、正文只覆盖部分和重复片段。
+- **检查与产物**为来源、单元、完整摘录同时匹配，以及重复证据不加分。启用 Day7 后执行。
+
+### 测试五：同题配对计算
+
+- **函数**为 `test_paired_delta_uses_common_denominator_and_keeps_zero`。
+- **数据来源**是包含正变化、负变化、零和缺测的成对值。
+- **检查与产物**为有效分母、均值方向与全缺测结果正确。启用 Day7 后执行。
+
+### 测试六：跨版本题和复核合并
+
+- **函数**为 `test_cross_version_pair_reuses_hits_budget_and_manual_review`。
+- **数据来源**是 `W9D1-25` 的两个版本正文、版本说明和人工评分器。
+- **检查与产物**为只检索一次，原序漏关键段落，重排后两条证据都在预算内。验证附加调用、Token、待复核和合并后状态，产物位于 pytest 临时目录。
+
+### 测试七：重排异常、未知用量与后续题
+
+- **函数**为 `test_rerank_failure_records_unknown_usage_and_other_cases_continue`。
+- **数据来源**是超时评分、没有用量的回答以及没有候选的未知版本题。
+- **检查与产物**为重排错误单独记录，后续题继续，未知用量和实际零调用分别计数。产物位于 pytest 临时目录。
+
+### 测试八：30 题完整离线对照
+
+- **函数**为 `test_offline_thirty_questions_write_two_rows_per_question`。
+- **数据来源**是冻结的 30 道题、人工向量和固定模型输出。
+- **检查与产物**为每题两路，共 60 条执行明细与 30 道配对记录，输出到 `runs/day7/offline/`。人工输出用于验证对照流程。
+
+### 测试九：真实六题对照
+
+- **函数**为 `test_real_week9_paired_comparison_on_six_cases`。
+- **数据来源**是 Day6 的 6 道代表题、已有 Ollama 索引和 DeepSeek。
+- **检查与产物**为两路都记录、策略合规和重排实际调用，输出到 `runs/day7/real_model/`。对照质量以原始证据与人工复核为准。
+
+### 运行命令
+
+使用项目根目录的 `.venv` 运行完整离线验收。
+
+```bash
+RUN_WEEK9_DAY7=1 RUN_WEEK9_DAY7_REAL=0 \
+.venv/bin/python -B -m pytest tests/test_week9_day7.py -v -s -p no:cacheprovider
+```
+
+先启动 Ollama 并配置已有 DeepSeek 环境，再执行可选的真实对照。
+
+```bash
+RUN_WEEK9_DAY7=1 RUN_WEEK9_DAY7_REAL=1 \
+.venv/bin/python -B -m pytest \
+tests/test_week9_day7.py::test_real_week9_paired_comparison_on_six_cases \
+-v -s -p no:cacheprovider
+```
+
+从本次运行目录取 `reviews_template.json` 的副本填写人工结论。按两路各自的 `review_applicable` 检查支持性、完整性或拒答理由，再依次生成复核明细和配对版汇总。
+
+```bash
+.venv/bin/python -B -m rag.output_evaluation \
+  /path/to/evaluation_report.json /path/to/reviews.json
+.venv/bin/python -B -m rag.quality_comparison /path/to/reviewed_report.json
+```
+
+可用 `WEEK9_RAG_DATASET`、`WEEK9_DAY7_OUTPUT`、`WEEK9_DAY7_INDEX` 指定路径。
+
+<a id="week9-summary"></a>
+
+## Week9 完成小结
+
+本周把 RAG 从能检索、能回答，推进到**知道证据是否合规、哪里漏掉，以及优化是否值得**。
+
+- **Day1～Day3 建立可比较的基线。** 冻结 30 道题和 21 份知识，用 Recall@K、MRR 定位漏召回，再结合向量、关键词和 RRF，处理容易混淆的精确标识符。
+- **Day4～Day5 改善入选证据。** 重排能把有用片段送进预算。版本、状态与权限过滤把真实 30 题中出现不合规来源的题数从 4 降到 0，22 道可计分题的 Context Recall 保持 100%。
+- **Day6～Day7 让错误和代价可以评估。** Day6 真实复核 5 题通过、1 题失败。跨版本题说明命中文档仍可能漏掉实际规则。Day7 把摘录覆盖、回答、Token 和延迟放到同题对照中，真实复验确认重排可以补齐这道跨版本题的证据。
