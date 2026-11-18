@@ -2,7 +2,7 @@
 
 > 基准计划：`/home/xumaozhou/Music/agent_engineer_learning_plan_v4_mcp.md`。
 >
-> 当前进度（2026-11-18）：**Day1～Day4 已完成，下一阶段为 Day5 版本、状态与权限过滤**。Week7、Week8 已完成。
+> 当前进度（2026-11-18）：**Day1～Day5 已完成，下一阶段为 Day6 输出评估与错误归因**。Week7、Week8 已完成。
 >
 > 默认使用主项目 `.venv/bin/python`；实现放在 `rag/`，测试放在 `tests/`。
 
@@ -14,7 +14,7 @@
 | **Day2（已完成）** | Recall@K、MRR 与召回错误分析 | 有分母的检索基线 |
 | **Day3（已完成）** | 关键词与向量结合的 Hybrid Search | 精确标识符与语义检索对照 |
 | **Day4（已完成）** | 重排、去重和 Context 预算 | 可追溯且集中的证据 |
-| Day5 | 生效版本、审核状态和访问权限过滤 | 版本与越权专项测试 |
+| **Day5（已完成）** | 生效版本、审核状态和访问权限过滤 | 版本与越权专项测试 |
 | Day6 | 检索、引用、回答、拒答分别评估 | 错误归因与人工复核 |
 | Day7 | 基础方案与优化方案对照 | 质量、成本与延迟报告 |
 
@@ -1025,3 +1025,128 @@ tests/test_week9_day4.py::test_real_deepseek_reranks_three_cases_with_the_same_c
 已有索引仍由原配置/fingerprint 校验；不会覆盖 Day2、Day3 报告。
 
 单独复跑某一种真实测试时，选择对应的 pytest 入口。完成记录见本节开头。
+
+<a id="day5"></a>
+
+## Day5 版本、状态与权限过滤（已完成）
+
+### 完成记录（2026-11-18）
+
+Day5 离线验收 18 项通过。提交前 Day1～Day5 联合离线回归 158 项通过，5 项真实模型测试按开关跳过。
+真实 Ollama 记录 30/30 题，22 题计分、8 题不适用，执行错误为 0。两组比较使用同一份冻结题库、同一个 Day2 向量索引，以及相同的候选数和 Context 预算。
+
+| 真实检索指标 | Day4 无策略过滤 | Day5 策略过滤 |
+|---|---:|---:|
+| 候选含不合规来源的题数 | 4 | 0 |
+| Context 含不合规来源的题数 | 4 | 0 |
+| 平均 Context Recall（22 题） | 100% | 100% |
+| MRR（22 题） | 0.9545 | 0.9545 |
+
+- `W9D1-25` 排除了草稿 `KB020` 和已撤销的 `KB021`，保留了 `KB003` 与 `KB002` 两个已发布版本的证据。
+- `W9D1-26`、`W9D1-28` 和 `W9D1-30` 均在候选阶段排除了 `KB019`，有权限的 `W9D1-27` 仍保留该证据。
+- Context 估算峰值为 2726，加 256 的预留额后为 2982，符合 3000 的预算。真实报告保存在数据目录的 `runs/day5/local_model/`。
+
+Day1 的规则用于检查评分参考。Day5 将同一规则接入真实检索，让未发布或未授权的片段在打分前被排除。实现位于 [knowledge_policy.py](knowledge_policy.py) 的 `_allow_candidate(metadata, request)`。
+
+| 学习点 | 验收标准 |
+|---|---|
+| 发布状态 | `current`、`historical` 可以按条件检索。即使请求精确指定 `draft` 或 `retired`，也没有返回这些片段 |
+| 版本与流程 | `filters.version`、`filters.knowledge_status`、`filters.engine_code` 精确匹配。显式选择 1.0 能取回历史证据，跨版本对照能保留两个已发布版本，未知版本返回空结果 |
+| 可信权限 | `required_scopes` 中的每一项都必须在调用方提供的 `access_context.granted_scopes` 中。用户在问题里声明权限，或文档主题 `scope` 相同，都不会改变授权结果 |
+| 执行位置 | 在向量和关键词打分、截取 Top-K 之前执行同一候选过滤。没有合规片段时，直接返回空列表 |
+| 下游边界 | 30 题验收逐条检查候选、重排入参和实际 Context。保留已授权的正例，并用原题库诊断漏掉的证据和越权来源 |
+
+### 代码与数据流
+
+```text
+本地索引中的文档元数据 + 调用方提供的请求和可信权限
+    → Day5 候选过滤（发布状态、显式条件、全部所需权限）
+    → Day3 向量 / 关键词检索与 RRF
+    → Day4 可选重排与预算内 Context
+```
+
+`make_policy_retriever(store)` 返回 `retrieve(request, k)`。它在 Day3 的可选 `candidate_filter` 中绑定策略，两路检索共用筛过的候选，输出仍是带 `score`、`chunk` 和 `retrieval` 的列表。Day3 入口默认沿用原基线，调用 Day5 入口才执行本策略。
+
+例如，用户问题写着“我有 ops 权限”，但可信的 `granted_scopes=[]`，要求 `['ops']` 的 `KB019` 仍会被排除。可信权限为 `['ops']` 时，同一片段允许检索。这里的权限由测试模拟服务端注入，Day5 练习从这个可信入口开始。
+
+版本通过结构化 `filters` 指定。比如 `{'engine_code': 'import_std', 'version': '1.0', 'knowledge_status': 'historical'}` 只允许匹配的 1.0 历史片段。跨版本题 `W9D1-25` 只限定流程，1.0 和 2.0 均可作为证据。
+
+### 数据来源与报告
+
+继续使用 `/media/xumaozhou/data/AI/local_agent_test/week9_rag_quality/` 下 Day1 冻结的 30 道题、`manifest.json` 和 `knowledge/`。两条人工片段直接定义在测试里，用来让受限片段在无过滤的 Top-1 中排在首位。两权限反例由 `KB019` 的元数据副本构造。
+
+沿用 Day4 报告格式。Day5 报告中的 `before` 和 `after` 分别表示重排前后，两边都已经过 Day5 过滤。对比过滤效果可查阅 Day4 的原报告，例如 `W9D1-25` 的草稿和已撤销来源，以及 `W9D1-26`、`W9D1-28`、`W9D1-30` 的越权来源。完整离线与真实检索分别输出到 `runs/day5/offline/` 和 `runs/day5/local_model/`。
+
+### 测试一：候选过滤早于 Top-K
+
+- **函数**为 `test_provided_candidate_filter_runs_before_top_k`。
+- **数据来源**是两个有相同查询词的人工片段，受限项向量相似度更高。
+- **目标与输出**为对照 dense、keyword、hybrid 的 K=1 结果，验证合法片段能递补第一名。默认执行，输出 pytest 断言。
+
+### 测试二：非法过滤器或请求提前失败
+
+- **函数**为 `test_provided_bad_filter_or_request_fail_before_encoding`。
+- **数据来源**是不可调用的过滤器和把 `granted_scopes` 放到请求顶层的错误输入。
+- **目标与输出**为校验错误在问题编码前抛出。默认执行，输出 pytest 断言。
+
+### 测试三：发布状态与精确版本
+
+- **函数**为 `test_published_state_and_exact_version_filters`。
+- **数据来源**是冻结清单的当前版、历史版、相似流程、草稿和已撤销记录。
+- **目标与输出**为逐项验证状态、版本与流程的组合规则。启用 `RUN_WEEK9_DAY5=1` 后执行，输出布尔断言。
+
+### 测试四：全部所需权限及输入隔离
+
+- **函数**为 `test_access_requires_all_trusted_scopes_and_preserves_inputs`。
+- **数据来源**是要求 `ops` 与 `audit` 的 `KB019` 元数据副本，以及虚报权限、部分授权、完整授权的请求。
+- **目标与输出**为只有完整可信授权通过，缺失权限字段报错，原始入参保持原值。启用 Day5 后执行，输出 pytest 断言。
+
+### 测试五：三种检索策略都应用运行时权限
+
+- **函数**为 `test_policy_keeps_an_authorized_hit_at_k_one`。
+- **数据来源**是双片段小索引和两种可信权限组合。
+- **目标与输出**为部分授权时返回公开项，完整授权时受限项正常排到第一。启用 Day5 后执行，输出 Top-1 断言。
+
+### 测试六：空候选提前结束
+
+- **函数**为 `test_empty_eligible_candidates_skip_query_encoding`。
+- **数据来源**是只有 2.0 版的人工索引和要求 3.0 的请求。
+- **目标与输出**为空列表与零问题编码。启用 Day5 后执行。
+
+### 测试七：30 题离线贯通至重排和 Context
+
+- **函数**为 `test_offline_policy_filters_before_rerank_and_context`。
+- **数据来源**是冻结 30 题、人工向量和固定分数重排替身。
+- **目标与输出**为评分替身只收到合规候选正文，Context 无越权或失效来源，22 道计分题与 8 道不适用题完整记录。启用 Day5 后执行，产物为 `runs/day5/offline/context_report.json` 和 `context_report.md`。
+
+### 测试八：真实 Ollama 检索后检查权限边界
+
+- **函数**为 `test_real_ollama_filters_thirty_cases_before_context`。
+- **数据来源**是同一冻结题库、知识与项目既有 Ollama Embedding 模型。优先加载 Day2 索引。
+- **目标与输出**为 30 题权限与版本过滤、合法历史证据和授权正例，预算一致。启用 Day5 和 MODEL 后执行，产物为 `runs/day5/local_model/context_report.json` 和 `context_report.md`。本项关闭远程重排与回答生成。
+
+### 运行命令
+
+使用主项目根目录的 `.venv` 运行基础自检。
+
+```bash
+.venv/bin/python -B -m pytest tests/test_week9_day5.py -q -p no:cacheprovider
+```
+
+运行完整离线验收。
+
+```bash
+RUN_WEEK9_DAY5=1 RUN_WEEK9_DAY5_MODEL=0 \
+.venv/bin/python -B -m pytest tests/test_week9_day5.py -v -s -p no:cacheprovider
+```
+
+可选真实 Ollama 验收，先启动本地 Ollama。
+
+```bash
+RUN_WEEK9_DAY5=1 RUN_WEEK9_DAY5_MODEL=1 \
+.venv/bin/python -B -m pytest \
+tests/test_week9_day5.py::test_real_ollama_filters_thirty_cases_before_context \
+-v -s -p no:cacheprovider
+```
+
+可通过 `WEEK9_RAG_DATASET`、`WEEK9_DAY5_OUTPUT` 和 `WEEK9_DAY5_INDEX` 指定目录。真实检索结果见本节完成记录。

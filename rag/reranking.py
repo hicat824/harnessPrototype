@@ -233,17 +233,20 @@ async def run_context_comparison(dataset_dir: str | Path, retrieve, score_pairs:
                                 output_dir: str | Path, *, mode: str, case_ids: list[str] | None = None,
                                 candidate_k: int = 20, max_tokens: int = 3000, reserved_tokens: int = 256,
                                 count_tokens_fn: TokenCounter = estimate_tokens,
-                                counter_name: str = 'character_half_estimate', backend_info: dict | None = None) -> dict:
+                                counter_name: str = 'character_half_estimate', backend_info: dict | None = None,
+                                report_title: str = 'Week9 Day4 重排与 Context 对照') -> dict:
     """已提供：检索一次 → 去重 → 同预算前后 Context 对照，不生成最终答案。
 
     retrieve(request,k) 只接收纯运行 input；重排器只接收问题和候选正文，不接收评分参考。
     mode 区分 offline_fixture/local_model/real_llm；真实模型用量未由适配器提供时为 None。
+    report_title 自定义 Markdown 标题，便于其他每日验收复用同一报告格式。
     错误按阶段和类型逐题保存，失败不计入均值。NotImplementedError 直接抛出。
     """
     if mode not in ('offline_fixture', 'local_model', 'real_llm'):
         raise ValueError('mode 必须区分人工、本地检索和真实模型重排')
     if type(candidate_k) is not int or not 0 < candidate_k <= 20:
         raise ValueError('candidate_k 必须为 1～20 的整数')
+    _text(report_title, 'report_title')
     root, output = Path(dataset_dir).resolve(), Path(output_dir).resolve()
     if output == root or output == root / 'knowledge' or root / 'knowledge' in output.parents:
         raise ValueError('输出目录不能覆盖输入或知识目录')
@@ -267,7 +270,7 @@ async def run_context_comparison(dataset_dir: str | Path, retrieve, score_pairs:
             applicable=sum(bool(case['expected']['doc_groups']) for case in cases))
         (output / 'context_report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + '\n', encoding='utf-8')
         summary = report['summary']
-        lines = ['# Week9 Day4 重排与 Context 对照', '', f'模式：`{mode}`；计数器：`{counter_name}`，当前标为估算/测试代理。', '',
+        lines = [f'# {report_title}', '', f'模式：`{mode}`；计数器：`{counter_name}`，当前标为估算/测试代理。', '',
             f"已记录 {summary['completed_cases']}/{summary['planned_cases']} 题；成功配对算分 {summary['paired_evaluated_cases']}/"
             f"{summary['planned_applicable_cases']}，不适用 {summary['not_applicable_cases']}，执行错误 {summary['execution_error_count']}。", '',
             '均值只比较成功配对的相同题目；预算针对完整证据 JSON 加预留额，不是模型实际用量。', '',

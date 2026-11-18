@@ -9,6 +9,7 @@ import json
 import math
 from pathlib import Path
 import re
+from typing import Callable
 
 from rag.eval_dataset import DEFAULT_DATASET, _check_input, validate_benchmark
 from rag.retrieval_metrics import DEFAULT_KS, run_retrieval_evaluation
@@ -190,11 +191,13 @@ def prepare_search_store(dataset_dir: str | Path, index_dir: str | Path, encoder
     return store, info
 
 
-def make_search_retriever(store, strategy: str, *, candidate_k: int = 20, rank_constant: int = 60):
+def make_search_retriever(store, strategy: str, *, candidate_k: int = 20, rank_constant: int = 60,
+                          candidate_filter: Callable[[dict, dict], bool] | None = None):
     """已提供：准备 dense/keyword/hybrid 回调，兼容 Day2 的 retrieve(request, k)。
 
     dense 保留 Day2 基线；keyword/hybrid 在两路共同候选中执行精确标识符约束。
-    每路最多 candidate_k 项，融合后再取 K。权限与 draft/retired 排除仍留待 Day5。
+    每路最多 candidate_k 项，融合后再取 K。candidate_filter(metadata, request)
+    可在两路共同的候选阶段增加条件，省略时沿用 Day3 基线。
     """
     from dataclasses import asdict
     from rag.langchain_rag import _store_info, document_chunk
@@ -204,6 +207,8 @@ def make_search_retriever(store, strategy: str, *, candidate_k: int = 20, rank_c
         raise ValueError('strategy 必须为 dense/keyword/hybrid')
     _positive(candidate_k, 'candidate_k')
     _positive(rank_constant, 'rank_constant')
+    if candidate_filter is not None and not callable(candidate_filter):
+        raise ValueError('candidate_filter 必须可调用')
     _store_info(store)
     chunks = [asdict(document_chunk(document)) for document in store.get_by_ids(list(store.store))]
 
@@ -213,7 +218,9 @@ def make_search_retriever(store, strategy: str, *, candidate_k: int = 20, rank_c
         if k > candidate_k:
             raise ValueError('最终 K 不能超过固定 candidate_k')
         constraints = identifier_constraints(request)
-        candidates = [chunk for chunk in chunks if _matches_filters(chunk['metadata'], request['filters'])
+        candidates = [chunk for chunk in chunks
+                      if (candidate_filter is None or candidate_filter(chunk['metadata'], request))
+                      and _matches_filters(chunk['metadata'], request['filters'])
                       and (strategy == 'dense' or matches_identifiers(chunk, constraints))]
         if not candidates:
             return []
