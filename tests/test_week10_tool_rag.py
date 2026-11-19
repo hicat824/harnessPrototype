@@ -1,4 +1,4 @@
-"""Week10 离线验收。默认检查样例，按天启用 Day1 路由或 Day2 Context 验收。"""
+"""Week10 验收。离线路径和 Day3 真实模型路径通过各自的开关启用。"""
 
 import json
 import os
@@ -6,10 +6,15 @@ from dataclasses import asdict
 from pathlib import Path
 
 import pytest
+from agents import SQLiteSession
+from agents.testing.model import ScriptedModel, assistant_message, function_call
+from agents.tracing import setup as tracing_setup
+from agents.tracing.provider import DefaultTraceProvider
 
 from week6 import BusinessAPIClient, BusinessResult, BusinessService, create_mock_http_client
 from week10_tool_rag import (
     Day1Request, KnowledgeEvidence, build_day2_context, prepare_knowledge_query, run_day1,
+    build_day3_agent, query_task_tool, run_day3_agent, search_knowledge_tool,
 )
 
 
@@ -22,6 +27,9 @@ DAY1 = pytest.mark.skipif(os.environ.get("RUN_WEEK10_DAY1") != "1",
 DAY2_OUTPUT = Path(os.environ.get("WEEK10_DAY2_OUTPUT", DATASET / "runs/day2"))
 DAY2 = pytest.mark.skipif(os.environ.get("RUN_WEEK10_DAY2") != "1",
                          reason="完整 Context 验收需设置 RUN_WEEK10_DAY2=1")
+DAY3_OUTPUT = Path(os.environ.get("WEEK10_DAY3_OUTPUT", DATASET / "runs/day3"))
+DAY3 = pytest.mark.skipif(os.environ.get("RUN_WEEK10_DAY3") != "1",
+                         reason="Day3 离线验收需设置 RUN_WEEK10_DAY3=1")
 
 
 @pytest.fixture(scope="module")
@@ -245,3 +253,187 @@ def test_day2_packs_complete_evidence_within_budget(day2_cases, day2_evidence, d
     path.write_text(json.dumps({"passed": True, "cases": rows}, ensure_ascii=False, indent=2)
                     + "\n", encoding="utf-8")
     print(f"Day2 Context 验收报告：{path}")
+
+
+def test_day3_tool_schemas():
+    """SDK 只把业务参数暴露给模型，本地依赖通过 Context 注入。"""
+    for tool, name, parameter in (
+        (query_task_tool, "query_task", "task_id"),
+        (search_knowledge_tool, "search_knowledge", "query"),
+    ):
+        assert tool.name == name
+        assert set(tool.params_json_schema["properties"]) == {parameter}
+        assert tool.params_json_schema["properties"][parameter]["type"] == "string"
+        assert tool.params_json_schema["required"] == [parameter]
+
+
+def _day3_last_tool_context(call):
+    return json.loads([item["output"] for item in call.input
+                       if item.get("type") == "function_call_output"][-1])
+
+
+@pytest.fixture
+def day3_local_tracing(monkeypatch):
+    """复用 Week6 的离线追踪设置，测试期间使用没有远程导出器的 provider。"""
+    monkeypatch.setattr(tracing_setup, "GLOBAL_TRACE_PROVIDER", DefaultTraceProvider())
+
+
+def _day3_script(case_input):
+    """模拟模型发起调用，组合路径从 SDK 真正送回的工具结果获取状态。"""
+    needs_state, needs_rule = case_input["needs_current_state"], case_input["needs_rule"]
+    task_id = case_input["task_id"]
+    if needs_state and task_id is None:
+        return ScriptedModel([[assistant_message("请提供任务编号。")]])
+
+    def respond(call):
+        context = _day3_last_tool_context(call)
+        task = context["task_query"]
+        if task is not None and task["fact"] is None:
+            return [assistant_message(f"任务查询失败（{task['error_code']}）。")]
+        citations = [item["evidence_id"] for item in context["knowledge"]]
+        if task is not None:
+            citations.insert(0, task["fact"]["evidence_id"])
+        return [assistant_message("依据本轮证据 " + "、".join(citations))]
+
+    def search_after_query(call):
+        task = _day3_last_tool_context(call)["task_query"]
+        if task["fact"] is None:
+            return respond(call)
+        state = task["fact"]["state"]
+        return [function_call("search_knowledge", {"query": f"{state} 状态的业务含义是什么？"},
+                              call_id="search")]
+
+    steps = []
+    if needs_state:
+        steps.append([function_call("query_task", {"task_id": task_id}, call_id="task")])
+    if needs_rule:
+        if needs_state:
+            steps.append({"responder": search_after_query})
+        else:
+            steps.append([function_call("search_knowledge", {"query": case_input["question"]},
+                                        call_id="search")])
+    steps.append({"responder": respond})
+    return ScriptedModel(steps)
+
+
+def _day3_cases():
+    cases = json.loads((DATASET / "eval_cases.json").read_text(encoding="utf-8"))["cases"]
+    return [case for case in cases if case["day"] == 1]
+
+
+async def _check_day3_sdk_cases(cases, scenarios, evidence, model_for_case):
+    topics = scenarios["knowledge"]["topics"]
+    rows = []
+    with create_mock_http_client(scenarios["subject_id"]) as client:
+        service = BusinessService(BusinessAPIClient(client))
+        for case in cases:
+            case_input, expected = case["input"], case["expected"]
+            model = model_for_case(case_input)
+            session = SQLiteSession(case["case_id"])
+            try:
+                result = await run_day3_agent(
+                    build_day3_agent(model), case_input["question"], query_task=service.query_task,
+                    search_knowledge=lambda query: (evidence,) if any(word in query for word in topics) else (),
+                    session=session,
+                )
+            finally:
+                session.close()
+            items = [item.to_input_item() for item in result.new_items]
+            calls = [item for item in items if item["type"] == "function_call"]
+            outputs = [json.loads(item["output"]) for item in items if item["type"] == "function_call_output"]
+            assert [item["name"] for item in calls] == expected["tool_order"], case["case_id"]
+            assert len(outputs) == len(calls)
+            for call in calls:
+                args = json.loads(call["arguments"])
+                if call["name"] == "query_task":
+                    assert args["task_id"] == case_input["task_id"]
+                elif expected["route"] == "rag_only":
+                    assert args["query"] == case_input["question"]
+                else:
+                    assert all(term in args["query"] for term in expected["query_contains"])
+                    assert all(term not in args["query"] for term in expected["query_excludes"])
+            last = outputs[-1] if outputs else {}
+            task = last.get("task_query") or {}
+            fact = task.get("fact") or {}
+            assert (fact.get("state"), fact.get("source")) == (expected["task_state"], expected["task_source"])
+            assert [item["doc_id"] for item in last.get("knowledge", [])] == expected["doc_ids"]
+            assert isinstance(result.final_output, str) and result.final_output.strip()
+            if expected["status"] == "error":
+                assert task["error_code"] == expected["reason"] and expected["reason"] in result.final_output
+            if expected["status"] == "needs_input":
+                assert "任务编号" in result.final_output
+            rows.append({"case_id": case["case_id"], "question": case_input["question"],
+                         "route": expected["route"], "calls": calls,
+                         "contexts": outputs, "answer": result.final_output})
+    return rows
+
+
+def _save_day3_report(filename, model, rows):
+    DAY3_OUTPUT.mkdir(parents=True, exist_ok=True)
+    path = DAY3_OUTPUT / filename
+    path.write_text(json.dumps({"passed": True, "model": model, "cases": rows},
+                               ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"Day3 SDK 验收报告：{path}")
+
+
+@DAY3
+@pytest.mark.usefixtures("day3_local_tracing")
+@pytest.mark.asyncio
+async def test_day3_sdk_tool_loop(scenarios, evidence):
+    """走真实 Runner，检查五种场景的工具参数、顺序与返回证据。"""
+    rows = await _check_day3_sdk_cases(_day3_cases(), scenarios, evidence, _day3_script)
+    assert len(rows) == 5
+    _save_day3_report("sdk_report.json", "scripted", rows)
+
+
+@DAY3
+@pytest.mark.usefixtures("day3_local_tracing")
+@pytest.mark.asyncio
+async def test_day3_session_restores_previous_tool_result(tmp_path, scenarios):
+    """使用同一 SQLite Session 续问上一轮，核对历史工具结果确实进入模型输入。"""
+    question = "任务 12345 现在是什么状态？"
+
+    def follow_up(call):
+        fact = _day3_last_tool_context(call)["task_query"]["fact"]
+        return [assistant_message(f"上一轮查询的是任务 {fact['task_id']}。")]
+
+    model = ScriptedModel([
+        [function_call("query_task", {"task_id": "12345"}, call_id="previous-task")],
+        [assistant_message("已查询任务状态。")],
+        {"responder": follow_up},
+    ])
+    agent = build_day3_agent(model)
+    session = SQLiteSession("week10-day3", tmp_path / "session.sqlite")
+    try:
+        with create_mock_http_client(scenarios["subject_id"]) as client:
+            service = BusinessService(BusinessAPIClient(client))
+            tools = dict(query_task=service.query_task, search_knowledge=lambda _: (), session=session)
+            await run_day3_agent(agent, question, **tools)
+            result = await run_day3_agent(agent, "我们上一轮查的是哪个任务？", **tools)
+        assert "12345" in result.final_output
+        assert all(item.to_input_item()["type"] != "function_call" for item in result.new_items)
+        history = await session.get_items()
+        assert any(item.get("type") == "function_call_output" for item in history)
+    finally:
+        session.close()
+
+
+@pytest.mark.skipif(os.environ.get("RUN_WEEK10_DAY3_LLM") != "1",
+                    reason="真实模型验收需设置 RUN_WEEK10_DAY3_LLM=1")
+@pytest.mark.usefixtures("day3_local_tracing")
+@pytest.mark.asyncio
+async def test_day3_real_model_routes(scenarios, evidence):
+    """把三条正常路径的原问题交给真实模型选择工具，业务和知识数据沿用本地样例。"""
+    from agents import OpenAIResponsesModel
+    from openai import AsyncOpenAI
+
+    api_key = os.environ.get("OPENAI_API_KEY")
+    assert api_key, "缺少项目现有的 DeepSeek OPENAI_API_KEY"
+    cases = [case for case in _day3_cases() if case["expected"]["status"] == "answered"]
+    assert {case["expected"]["route"] for case in cases} == {"tool_only", "rag_only", "tool_rag"}
+    model_name = "deepseek-flash"
+    async with AsyncOpenAI(api_key=api_key, base_url="https://api.deepseek.com",
+                           timeout=60.0, max_retries=0) as client:
+        model = OpenAIResponsesModel(model=model_name, openai_client=client)
+        rows = await _check_day3_sdk_cases(cases, scenarios, evidence, lambda _: model)
+    _save_day3_report("real_model_report.json", model_name, rows)
