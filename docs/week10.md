@@ -1,6 +1,6 @@
 # Week10 · Tool + RAG 协同
 
-**当前进度**　Day1 至 Day5 已完成（2026-11-20）。下一阶段为 Day6 分层 Agent Evals。
+**当前进度**　Day1 至 Day6 已完成（2026-11-20），下一阶段为 Day7 周验收。
 
 本周用 Week6 的 Mock 任务查询提供当前状态，用 Week9 的知识库解释静态业务规则。学习重点是决定每个问题需要哪些数据、先取哪一类证据，以及证据不足时如何追问或停止。每阶段的目标以 [V4 学习计划](/home/xumaozhou/Music/agent_engineer_learning_plan_v4_mcp.md#L359) 为准。
 
@@ -13,7 +13,7 @@
 | **Day3（已完成）** | Agents SDK 集成 | 用 `Runner` 和 Session 接入 Mock 查询和知识工具，验证 Agent 选路与传参 |
 | **Day4（已完成）** | 证据与不确定性 | 能区分查询事实、文档规则、推断与未知项 |
 | **Day5（已完成）** | 多轮续接与异常退出 | 补参和压缩后继续执行，权限失败或预算耗尽时明确停止 |
-| Day6 | 分层 Agent Evals | 用至少 30 条混合用例分别评估最终结果和工具调用过程 |
+| **Day6（已完成）** | 分层 Agent Evals | 用至少 30 条混合用例分别评估最终结果和工具调用过程 |
 | Day7 | 周验收 | 同题比较仅工具、仅 RAG 和自动混合路由的质量、耗时与可记录的 Token 用量 |
 
 ## Day1 · 路由与任务阶段
@@ -240,3 +240,78 @@ Day5 离线验收 **6 项通过**，与 Day1～Day4 合计 **23 项通过**。�
 ```bash
 RUN_WEEK10_DAY5=1 .venv/bin/python -B -m pytest tests/test_week10_tool_rag.py -k day5 -v -s -p no:cacheprovider
 ```
+
+## Day6 · 分层 Agent Evals
+
+Day6 离线验收 **4 项通过**。30 题共 37 轮，Trajectory 和 Outcome 均为 30/30。[Mock 评估报告](/media/xumaozhou/data/AI/local_agent_test/week10_tool_rag/runs/day6/mock_eval_report.json)
+
+Day6 要写的是**评分器**。前五天实现的任务流程作为被测对象。每道题给它一份输入，测试记录它实际做了什么、最后答了什么，再把这两份记录和该题的预期逐轮对照。今天要学会区分两种情况：答案碰巧正确，但中途查错了；工具都用对了，但最后漏答了。
+
+### 跟一题看两处练习接在哪里
+
+以 `W10D6-17` 为例，用户问「我猜 12345 是 FAILED，确认并解释查到的状态」。数据集的 `input` 提供问题、已识别的查询与解释意图、任务编号和 Mock 身份。`expected_turns` 另存每轮的评分标准，执行结束后才交给评分器。[Day6 用例集](/media/xumaozhou/data/AI/local_agent_test/week10_tool_rag/day6_eval_cases.json)
+
+1. **执行并记录。** Day5 复用 Day1 的组合路由，先用 `query_task` 查任务 `12345`。Week6 Mock 返回当前状态 `RUNNING`，执行器再用这个状态询问其含义，知识工具命中 `KB006.md#L6`。测试把两次调用的工具名、实际参数、检索命中位置记入本轮的 `calls`。**这就是练习一的输入。**
+2. **组装证据并回答。** Day2 把本轮 API 事实和预算内的文档片段组装成 `context`。测试从中生成 Day4 格式的固定答复 `answer`，其中当前任务应为 `12345 / RUNNING`，引用 API 事实 `T1`，状态释义引用文档片段 `K1`。执行器另给出 `result`，记录本轮是否答完、为何停止。**这三份数据和本轮要查询的任务编号一起进入练习二。** [执行与采集](../tests/test_week10_tool_rag.py#L685)
+3. **逐轮打分。** 批量测试取出对应的 `expected_turns` 条目，与上述实际记录一起传给两个评分函数。两个函数各返回三项成绩。多轮题每轮都有自己的调用记录和预期，例如第一轮应追问，补齐编号的下一轮才应查工具。[评分调用处](../tests/test_week10_tool_rag.py#L804)
+
+### 练习一 · Trajectory 怎样判断工具是否用对
+
+在 `grade_day6_trajectory(calls, expected)` 中，每个 `call` 是一次工具调用，`call.name` 是工具名。函数给**整轮**返回一个字典，三个键固定为 `tool_order`、`tool_arguments`、`retrieval`。每个值是该项的成绩，`True` 表示通过，`False` 表示失败，`None` 表示本轮不适用。召回项直接读取本轮检索记录，三项一起返回。[W10D6-1](../week10_tool_rag.py#L635)
+
+| 评分项 | 比较的数据与通过条件 |
+|---|---|
+| `tool_order` | 把 `[call.name for call in calls]` 与 `list(expected.tool_order)` 比较，将结果放在返回字典的 `tool_order` 键下。少一次、多一次或顺序颠倒都失败。预期和实际都为空列表时通过。 |
+| `tool_arguments` | 顺序正确后，将实际查询的任务编号列表与预期比较。每次知识检索的 `query` 必须包含全部指定词，并避开全部排除词。顺序错误时本项失败，双方均零调用时记为不适用。 |
+| `retrieval` | 用**检索刚返回的来源位置**核对预期，要求覆盖全部指定位置。预期空列表表示应搜索且零命中，预期为 `None` 表示本轮无需评召回。 |
+
+例如预期先查任务再查知识，实际却先查知识再查任务，知识检索仍命中了预期片段。此轮应返回 `{"tool_order": False, "tool_arguments": False, "retrieval": True}`。批量测试把这个字典放进该轮的 `trajectory`，再将值为 `False` 的项目列入 `failed_checks`。测试二包含完整字典的断言，也单独断言了交换顺序后的 `["tool_order"] is False`。[返回值断言](../tests/test_week10_tool_rag.py#L759) · [报告写入位置](../tests/test_week10_tool_rag.py#L811)
+
+### 练习二 · Outcome 怎样判断回答是否成立、是否答全
+
+在 `grade_day6_outcome` 中给**本轮停止结果和实际答复**评分。引用与原文由证据校验函数核对。[W10D6-2](../week10_tool_rag.py#L713)
+
+| 评分项 | 比较的数据与通过条件 |
+|---|---|
+| `status` | 将 `result.status`、`result.reason` 与预期逐项比较。例如正常答完应为 `answered` 且无停止原因，缺编号应为 `needs_input` 和 `MISSING_PARAMETER`。这里评的是执行结果，任务自身的 `RUNNING` 属于回答内容。 |
+| `source_support` | 用实际传给回答阶段的 **Context** 核验回答。当前状态声明须与所问任务、本轮 API 事实及引用一致。对本练习的抽取式规则答复，引用必须指向保留下来的片段，正文必须与该片段原文一致。 |
+| `final_answer` | 用**题目预期**核对回答内容。应报告当前状态时须答对任务编号和状态，应无状态声明时须留空。有效引用解析出的原文位置集合须与 `rule_sources` 一致。题目要求说明缺口时，`unknowns` 至少要有一项非空说明。 |
+
+仍看第 17 题。如果回答只解释了 `RUNNING`，并把当前状态写成未知，它给出的规则可以有据可查，执行也可以正常结束。但 API 已查明任务状态，用户要求的事实漏答了，因此 `final_answer` 失败。另一个值得对照的题是 `W10D6-11`：检索应命中第 6、14 行，260 字符的 Context 预算只留下第 6 行。因此召回按两处来源评分，回答按一处有效引用加缺口说明评分。
+
+### 怎样读验收报告
+
+先看 `failed_checks` 定位题号、轮次和失败项，再看该题 `turns` 里的实际调用、答复和被裁剪的证据编号。例如 `turn1.trajectory.tool_arguments` 指向首轮调用参数，`turn1.outcome.final_answer` 指向首轮答复内容。
+
+报告的通过率按题计算。同一指标在一题的所有适用轮次都通过，才算该题通过；整题都不适用就跳过该题。每项的 `rate` 等于通过题数 `passed` 除以适用题数 `applicable`，分母为零时记录 `null`。每层的 `overall` 则看一题所有轮次、该层所有指标是否出现失败。整批验收要求两层都通过。
+
+### 测试一 · 数据集检查
+
+- **数据来源**　`week10_tool_rag/day6_eval_cases.json` 提供 30 个案例，含仅工具、仅 RAG、组合路由、停止与续接五类。
+- **测试逻辑**　检查题量、ID 唯一性和每题的参考轮次。可单独运行 `-k day6_dataset`。
+
+### 测试二 · 执行轨迹评分
+
+- **数据来源**　测试提供一条 `query_task` 和一条 `search_knowledge` 记录，知识返回引用 Week9 的 `KB006.md#L6`。
+- **测试逻辑**　即使检索命中，带入干扰词也应判为参数错误。交换调用顺序或遗漏检索时，对应指标失败。正常零调用时参数和召回均不适用。
+
+### 测试三 · 结果评分
+
+- **数据来源**　测试构造 `RUNNING` 的查询结果，引用原有的 KB006 文档片段。
+- **测试逻辑**　先验收正确答复，再分别删掉当前状态、把规则正文改成与引用相反的意思，核对能否定位到回答不完整或来源不支持。
+
+### 测试四 · 30 题 Mock 批量评估
+
+- **数据来源**　题目与参考答案来自 Day6 数据集。业务查询由 Week6 的 Mock API 执行，知识原文来自 Week9 的 KB006 第 6、11、14 行，按固定词表检索。
+- **测试逻辑**　逐题新建任务，逐轮采集调用参数、召回位置和实际答复。两层指标全部通过才验收成功。覆盖 `FORBIDDEN`、超时、空结果、知识缺失、补参续跑、预算耗尽和已结束任务的重复请求。
+- **输出**　默认写入测试数据目录下的 `runs/day6/mock_eval_report.json`。报告记录两层通过率、适用题数、失败项和实测耗时。Mock 路径的模型用量记为 `null`。本测试验收确定性流程、证据和评分逻辑。真实模型的自主选路、真实检索质量及语义支持需通过各自的模型验收。
+
+### 运行验收
+
+在主项目根目录运行 Day6 离线验收。
+
+```bash
+RUN_WEEK10_DAY6=1 .venv/bin/python -B -m pytest tests/test_week10_tool_rag.py -k day6 -v -s -p no:cacheprovider
+```
+
+测试默认从 `/media/xumaozhou/data/AI/local_agent_test/week10_tool_rag/` 读数据。可用 `WEEK10_DATASET`、`WEEK9_RAG_DATASET` 覆盖输入目录，用 `WEEK10_DAY6_OUTPUT` 覆盖报告目录。

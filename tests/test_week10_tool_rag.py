@@ -2,8 +2,9 @@
 
 import json
 import os
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
+from time import perf_counter
 
 import pytest
 from agents import SQLiteSession
@@ -17,6 +18,7 @@ from week10_tool_rag import (
     build_day3_agent, query_task_tool, run_day3_agent, search_knowledge_tool,
     Day4Answer, Day4GroundedStatement, Day4TaskClaim, validate_day4_answer,
     Day5TaskState, run_day5_turn,
+    Day6ExpectedTurn, Day6ToolCall, grade_day6_outcome, grade_day6_trajectory,
 )
 
 
@@ -640,3 +642,192 @@ async def test_day5_resumes_after_compacting_session_history(day5_tools):
         day5_tools["search_knowledge"].assert_called_once()
     finally:
         session.close()
+
+DAY6 = pytest.mark.skipif(os.environ.get("RUN_WEEK10_DAY6") != "1",
+                         reason="Day6 离线验收需设置 RUN_WEEK10_DAY6=1")
+DAY6_OUTPUT = Path(os.environ.get("WEEK10_DAY6_OUTPUT", DATASET / "runs/day6"))
+
+
+@pytest.fixture(scope="module")
+def day6_dataset():
+    path = DATASET / "day6_eval_cases.json"
+    assert path.is_file(), f"找不到 Day6 样例，请检查 WEEK10_DATASET：{path}"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _day6_catalog(dataset):
+    # 和 Day1 一样从 Week9 文档加载原文。Mock 词表决定召回，评分答案不参与检索。
+    catalog = []
+    for entry in dataset["knowledge"]:
+        line = entry["line"]
+        text = (KNOWLEDGE_ROOT / entry["path"]).read_text(encoding="utf-8").splitlines()[line - 1]
+        item = KnowledgeEvidence(entry["doc_id"], f"{entry['path']}#L{line}", text)
+        catalog.append((item, entry["query_terms"]))
+    return catalog
+
+
+def _day6_mock_answer(result, context):
+    """仅用预算内的证据生成固定答复。复制规则原文，便于程序确定性核对。"""
+    payload = json.loads(context.text)
+    task_query = payload["task_query"]
+    fact = task_query["fact"] if task_query is not None else None
+    current_task = Day4TaskClaim(task_id=fact["task_id"], state=fact["state"],
+                                 evidence_id=fact["evidence_id"]) if fact else None
+    rules = [Day4GroundedStatement(text=item["text"], evidence_ids=[item["evidence_id"]])
+             for item in payload["knowledge"]]
+    unknowns = [result.reason] if result.reason else []
+    if payload["knowledge_truncated"]:
+        unknowns.append("部分知识证据未进入本轮 Context。")
+    return Day4Answer(current_task=current_task, rules=rules, inferences=[],
+                      unknowns=unknowns, next_steps=[])
+
+
+def _observe_day6_case(inputs, service, catalog):
+    """执行 Day5 多轮路径，逐轮记录工具、召回、证据和固定答复。"""
+    state = Day5TaskState(Day1Request(**inputs["request"]), max_tool_calls=inputs.get("max_tool_calls", 2))
+    active_sources = inputs.get("available_sources")
+    observations = []
+    task_result = None
+
+    def query_task(task_id):
+        nonlocal task_result
+        calls.append(Day6ToolCall("query_task", {"task_id": task_id}))
+        task_result = service.query_task(task_id)
+        return task_result
+
+    def search_knowledge(query):
+        hits = tuple(item for item, terms in catalog
+                     if (active_sources is None or item.source in active_sources)
+                     and any(term in query for term in terms))
+        calls.append(Day6ToolCall("search_knowledge", {"query": query}, tuple(item.source for item in hits)))
+        return hits
+
+    for supplied_task_id in [None, *inputs.get("follow_ups", [])]:
+        # 只清空本轮轨迹。任务状态及已取得的任务事实仍可被续轮使用。
+        calls = []
+        result = run_day5_turn(state, query_task=query_task, search_knowledge=search_knowledge,
+                               supplied_task_id=supplied_task_id)
+        context = build_day2_context(task_result, result.evidence, max_chars=inputs.get("max_context_chars", 6000))
+        answer = _day6_mock_answer(result, context)
+        requested_id = state.request.task_id if state.request.needs_current_state else None
+        observations.append((result, calls, context, answer, requested_id))
+    return observations
+
+
+def _day6_metrics(rows):
+    # 逐题统计，每个适用的轮次都通过才记一题通过。同题轮次多也只计一题。
+    metrics = {}
+    for layer in ("trajectory", "outcome"):
+        names = rows[0]["turns"][0][layer].keys()
+        metrics[layer] = {}
+        for name in names:
+            case_scores = []
+            for row in rows:
+                scores = [turn[layer][name] for turn in row["turns"] if turn[layer][name] is not None]
+                if scores:
+                    case_scores.append(all(scores))
+            applicable = len(case_scores)
+            passed = sum(case_scores)
+            metrics[layer][name] = {"passed": passed, "applicable": applicable,
+                                    "rate": passed / applicable if applicable else None}
+        passed = sum(all(score is not False for turn in row["turns"] for score in turn[layer].values())
+                     for row in rows)
+        metrics[layer]["overall"] = {"passed": passed, "applicable": len(rows), "rate": passed / len(rows)}
+    return metrics
+
+
+@DAY6
+def test_day6_dataset_has_thirty_mixed_cases(day6_dataset):
+    """单独核对样例数量、类别和轮次，填写评分函数前也能运行。"""
+    cases = day6_dataset["cases"]
+    assert len(cases) >= 30 and len({case["case_id"] for case in cases}) == len(cases)
+    assert {case["category"] for case in cases} == {
+        "tool_only", "rag_only", "tool_rag", "stops", "continuation",
+    }
+    for case in cases:
+        assert len(case["expected_turns"]) == 1 + len(case["input"].get("follow_ups", [])), case["case_id"]
+
+
+@DAY6
+def test_day6_trajectory_distinguishes_wrong_calls_from_a_retrieval_hit():
+    source = "knowledge/KB006.md#L6"
+    expected = Day6ExpectedTurn(["query_task", "search_knowledge"], "answered", task_ids=("12345",),
+                                query_contains=("RUNNING",), query_excludes=("FAILED",),
+                                retrieved_sources=[source])
+    task_call = Day6ToolCall("query_task", {"task_id": "12345"})
+    wrong_query = Day6ToolCall("search_knowledge", {"query": "RUNNING 还是 FAILED？"}, (source,))
+    assert grade_day6_trajectory([task_call, wrong_query], expected) == {
+        "tool_order": True, "tool_arguments": False, "retrieval": True,
+    }
+    assert grade_day6_trajectory([wrong_query, task_call], expected)["tool_order"] is False
+    assert grade_day6_trajectory([task_call], expected)["retrieval"] is False
+    wrong_task = Day6ToolCall("query_task", {"task_id": "23456"})
+    search = Day6ToolCall("search_knowledge", {"query": "解释 RUNNING"}, (source,))
+    assert grade_day6_trajectory([wrong_task, search], expected)["tool_arguments"] is False
+    assert grade_day6_trajectory([], Day6ExpectedTurn([], "needs_input")) == {
+        "tool_order": True, "tool_arguments": None, "retrieval": None,
+    }
+
+
+@DAY6
+def test_day6_outcome_distinguishes_source_support_from_answer_completeness(evidence):
+    task = BusinessResult(status="success", data={"task_id": "12345", "state": "RUNNING"})
+    context = build_day2_context(task, (evidence,))
+    result = run_day1(Day1Request("查询并解释任务 12345 的状态", True, True, "12345"),
+                      query_task=lambda _: task, search_knowledge=lambda _: (evidence,))
+    expected = Day6ExpectedTurn(["query_task", "search_knowledge"], "answered",
+                                task_id="12345", task_state="RUNNING", rule_sources=[evidence.source])
+    answer = _day6_mock_answer(result, context)
+    assert all(grade_day6_outcome(result, answer, context, expected, requested_task_id="12345").values())
+
+    missing = answer.model_copy(update={"current_task": None, "unknowns": ["状态未说明"]})
+    assert grade_day6_outcome(result, missing, context, expected, requested_task_id="12345") == {
+        "status": True, "source_support": True, "final_answer": False,
+    }
+    needs_explanation = replace(expected, requires_unknowns=True)
+    scores = grade_day6_outcome(result, answer, context, needs_explanation, requested_task_id="12345")
+    assert scores["final_answer"] is False
+
+    unsupported = answer.model_copy(update={"rules": [Day4GroundedStatement(
+        text="RUNNING 表示已完成", evidence_ids=["K1"],
+    )]})
+    assert grade_day6_outcome(result, unsupported, context, expected, requested_task_id="12345")["source_support"] is False
+
+
+@DAY6
+def test_day6_mock_evals_report_outcome_and_trajectory(day6_dataset):
+    catalog = _day6_catalog(day6_dataset)
+    rows = []
+    for case in day6_dataset["cases"]:
+        inputs = case["input"]
+        started = perf_counter()
+        with create_mock_http_client(inputs.get("subject_id", "alice")) as client:
+            observations = _observe_day6_case(inputs, BusinessService(BusinessAPIClient(client)), catalog)
+        elapsed = perf_counter() - started
+        assert len(observations) == len(case["expected_turns"]), case["case_id"]
+        turns = []
+        for (result, calls, context, answer, task_id), reference in zip(observations, case["expected_turns"]):
+            expected = Day6ExpectedTurn(**reference)
+            checks = {"trajectory": grade_day6_trajectory(calls, expected), "outcome": grade_day6_outcome(
+                result, answer, context, expected, requested_task_id=task_id,
+            )}
+            turns.append({"calls": [asdict(call) for call in calls], "route": result.route,
+                          "status": result.status, "reason": result.reason,
+                          "omitted_ids": context.omitted_ids, "answer": answer.model_dump(), **checks})
+        rows.append({"case_id": case["case_id"], "category": case["category"], "elapsed_seconds": elapsed,
+                     "turns": turns})
+
+    failed = {row["case_id"]: [f"turn{index}.{layer}.{name}"
+                              for index, turn in enumerate(row["turns"], 1)
+                              for layer in ("trajectory", "outcome")
+                              for name, score in turn[layer].items() if score is False]
+              for row in rows}
+    failed = {case_id: checks for case_id, checks in failed.items() if checks}
+    report = {"mode": "mock", "passed": not failed, "case_count": len(rows), "metrics": _day6_metrics(rows),
+              "elapsed_seconds": sum(row["elapsed_seconds"] for row in rows), "usage": None,
+              "failed_checks": failed, "cases": rows}
+    DAY6_OUTPUT.mkdir(parents=True, exist_ok=True)
+    path = DAY6_OUTPUT / "mock_eval_report.json"
+    path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"Day6 Mock 分层评估报告：{path}")
+    assert not failed, failed

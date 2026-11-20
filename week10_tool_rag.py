@@ -1,4 +1,4 @@
-"""Week10 的路由、证据校验、Agents SDK 和多轮任务练习。"""
+"""Week10 的路由、证据校验、Agents SDK、多轮任务与分层评估练习。"""
 
 import json
 from collections.abc import Callable, Sequence
@@ -583,3 +583,172 @@ def run_day5_turn(
         )
     state.last_result = result
     return result
+
+
+@dataclass(frozen=True)
+class Day6ToolCall:
+    """执行时记下的一次真实 Mock 调用。sources 只在知识检索时记录原文位置。"""
+
+    name: str
+    arguments: dict[str, str]
+    sources: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class Day6ExpectedTurn:
+    """用例对单轮行为的预期。只有评分阶段读取这些字段。
+
+    tool_order 是本轮预期工具顺序，task_ids 是按调用次序预期查询的编号。
+    query_contains 和 query_excludes 是知识检索词必须包含和排除的字面量。
+    retrieved_sources 是检索必须覆盖的原文位置。None 表示本轮无需检索，
+    [] 表示应运行检索且没有命中。rule_sources 是回答应当引用的文档位置。
+    status 和 reason 是预期执行结果与停止原因。task_id 和 task_state 均为 None
+    表示本轮回答不应声明当前任务状态。requires_unknowns 要求回答说明证据缺口。
+    """
+
+    tool_order: Sequence[str]
+    status: Outcome
+    reason: str | None = None
+    task_ids: Sequence[str] = ()
+    query_contains: Sequence[str] = ()
+    query_excludes: Sequence[str] = ()
+    retrieved_sources: Sequence[str] | None = None
+    task_id: str | None = None
+    task_state: str | None = None
+    rule_sources: Sequence[str] = ()
+    requires_unknowns: bool = False
+
+
+def _day6_retrieval_matches(calls: Sequence[Day6ToolCall], expected_sources: Sequence[str] | None) -> bool | None:
+    """用检索返回的原文位置评估召回，空检索与不适用分别记分。"""
+    if expected_sources is None:
+        return None
+    searches = [call for call in calls if call.name == "search_knowledge"]
+    if not searches:
+        return False
+    observed_sources = {source for call in searches for source in call.sources}
+    if not expected_sources:
+        return not observed_sources
+    return set(expected_sources).issubset(observed_sources)
+
+
+def grade_day6_trajectory(
+    calls: Sequence[Day6ToolCall], expected: Day6ExpectedTurn,
+) -> dict[str, bool | None]:
+    """评估执行过程，返回 tool_order、tool_arguments、retrieval 三项成绩。
+
+    calls 是一轮真实记录，按发生顺序排列。query_task 的 arguments 有 task_id，
+    search_knowledge 的 arguments 有 query。expected 来自用例参考答案。
+
+    W10D6-1 工具调用评分。
+    1. 依次取 calls 中每个 Day6ToolCall 对象的 call.name，得到实际工具名列表，
+       与 list(expected.tool_order) 比较。把比较结果放在返回字典的 "tool_order" 键下。
+    2. 实际与预期都没有调用时，tool_arguments 为 None。工具顺序不符时参数项为 False。
+       其余情况，把实际 query_task 的 task_id 列表与 expected.task_ids 比较。
+       逐条检查 search_knowledge 的 query，要求它包含每个 query_contains 字面量，
+       且不含任何 query_excludes 字面量。缺少对应参数时判 False。
+    3. 召回项已提供。它看检索原始返回的 sources，独立于 Context 限长和回答引用。
+
+    返回一份代表整轮的评分字典。比如两次工具顺序颠倒，但搜索仍命中预期文档时，
+    返回 {"tool_order": False, "tool_arguments": False, "retrieval": True}。
+    calls 保留原始记录。批量测试把返回的字典存入该轮的 trajectory，再汇总失败项。
+    """
+    retrieval = _day6_retrieval_matches(calls, expected.retrieved_sources)
+    actual_order = [call.name for call in calls]
+    order_ok = actual_order == list(expected.tool_order)
+
+    if not order_ok:
+        # 出现漏调、多调或乱序时，本轮的参数项也记失败。
+        argument_ok = False
+    elif not calls:
+        # 例如缺编号时应先追问。零调用符合预期，但没有参数可评分。
+        # 汇总报告会把 None 从参数正确率的分母中排除。
+        argument_ok = None
+    else:
+        # task_ids 来自参考轨迹。例如查 99999 得到 NOT_FOUND，调用参数仍可正确，
+        # 即使最终答复没有可报告的任务状态。这时 expected.task_id 可以为 None。
+        actual_task_ids = [call.arguments.get("task_id") for call in calls if call.name == "query_task"]
+        argument_ok = actual_task_ids == list(expected.task_ids)
+        for call in calls:
+            if call.name != "search_knowledge":
+                continue
+            # query 是一句检索问题。逐个核对必须出现和必须排除的词，
+            # 这样“解释 RUNNING”可以通过，而“RUNNING 还是 FAILED”可因干扰词失败。
+            query = call.arguments.get("query")
+            if (not isinstance(query, str)
+                    or not all(term in query for term in expected.query_contains)
+                    or any(term in query for term in expected.query_excludes)):
+                argument_ok = False
+                break
+
+    return {
+        "tool_order": order_ok,
+        "tool_arguments": argument_ok,
+        "retrieval": retrieval,
+    }
+
+
+def _day6_check_sources(
+    answer: Day4Answer, context: Day2Context, requested_task_id: str | None,
+) -> tuple[bool, set[str]]:
+    """校验实际 Context 的证据权限，并核对固定回答中的文档原文引用。"""
+    try:
+        validate_day4_answer(answer, context, requested_task_id=requested_task_id)
+    except ValueError:
+        return False, set()
+
+    knowledge = {item["evidence_id"]: item for item in json.loads(context.text)["knowledge"]}
+    # 本次答复是抽取式的。每条规则使用一个片段，正文与该片段原文一致。
+    cited_sources = set()
+    for rule in answer.rules:
+        if len(rule.evidence_ids) != 1:
+            return False, cited_sources
+        item = knowledge[rule.evidence_ids[0]]
+        if rule.text != item["text"]:
+            return False, cited_sources
+        cited_sources.add(item["source"])
+    return True, cited_sources
+
+
+def grade_day6_outcome(
+    result: Day1Result, answer: Day4Answer, context: Day2Context,
+    expected: Day6ExpectedTurn, *, requested_task_id: str | None,
+) -> dict[str, bool]:
+    """评估执行结果和最终答复，返回 status、source_support、final_answer 三项成绩。
+
+    result 来自本轮执行，提供真实停止状态和原因。answer 是回答阶段产出的结构，
+    context 是本轮实际可用的证据。requested_task_id 传本轮实际查询意图中的编号，
+    仅查静态规则或仍缺编号时传 None。expected 只在评分时使用。
+
+    W10D6-2 对 status 和 final_answer 分别评分。前者比较 result 与 expected 的 status、reason。
+    后者比较 answer.current_task：期望无任务状态时它必须为 None，否则其 task_id、
+    state 必须都与预期相同。同时，回答有效引用的文档位置集合必须与 expected.rule_sources
+    一致。若 requires_unknowns 为 True，还要通过已计算的 uncertainty_explained。
+    source_support 已由下方的函数计算，检查引用资格和文档原文。
+
+    例如只查任务 12345，执行状态正确且引用 T1 合法，但回答省略当前状态、只写未知项，
+    此时 status 和 source_support 可为 True，final_answer 必须为 False。
+    """
+    source_support, cited_sources = _day6_check_sources(answer, context, requested_task_id)
+    uncertainty_explained = not expected.requires_unknowns or any(text.strip() for text in answer.unknowns)
+    # status 描述执行器怎样结束。例如预期因权限停止时，error 与 FORBIDDEN 都要匹配。
+    status_ok = result.status == expected.status and result.reason == expected.reason
+
+    # current_task 是答复明确声称的事实。例如题目只问规则时，应当没有当前任务声明。
+    # 有声明时同时比较编号和状态，防止另一个同样处于 RUNNING 的任务被误判为正确。
+    claim = answer.current_task
+    if claim is None:
+        task_matches = expected.task_id is None and expected.task_state is None
+    else:
+        task_matches = claim.task_id == expected.task_id and claim.state == expected.task_state
+
+    # cited_sources 已将回答里的 K1 等编号解析成原文位置。既要覆盖预期规则，
+    # 也要在题目要求时写明证据缺口。遗漏任何一项，即使执行成功，回答仍未答全。
+    rules_match = cited_sources == set(expected.rule_sources)
+    final_answer = task_matches and rules_match and uncertainty_explained
+
+    return {
+        "status": status_ok,
+        "source_support": source_support,
+        "final_answer": final_answer,
+    }
