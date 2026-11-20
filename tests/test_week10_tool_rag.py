@@ -15,6 +15,7 @@ from week6 import BusinessAPIClient, BusinessResult, BusinessService, create_moc
 from week10_tool_rag import (
     Day1Request, KnowledgeEvidence, build_day2_context, prepare_knowledge_query, run_day1,
     build_day3_agent, query_task_tool, run_day3_agent, search_knowledge_tool,
+    Day4Answer, Day4GroundedStatement, Day4TaskClaim, validate_day4_answer,
 )
 
 
@@ -437,3 +438,95 @@ async def test_day3_real_model_routes(scenarios, evidence):
         model = OpenAIResponsesModel(model=model_name, openai_client=client)
         rows = await _check_day3_sdk_cases(cases, scenarios, evidence, lambda _: model)
     _save_day3_report("real_model_report.json", model_name, rows)
+
+
+DAY4 = pytest.mark.skipif(os.environ.get("RUN_WEEK10_DAY4") != "1",
+                         reason="Day4 离线验收需设置 RUN_WEEK10_DAY4=1")
+
+
+@pytest.fixture
+def day4_answer():
+    """与 Mock 的 RUNNING 状态及 KB006 的规则对应的结构化回答。"""
+    return Day4Answer(
+        current_task=Day4TaskClaim(task_id="12345", state="RUNNING", evidence_id="T1"),
+        rules=[Day4GroundedStatement(text="RUNNING 表示任务执行中。", evidence_ids=["K1"])],
+        inferences=[Day4GroundedStatement(text="据此推断任务尚未完成。", evidence_ids=["T1", "K1"])],
+        unknowns=["预计完成时间未知。"],
+        next_steps=["如需确认完成情况，可稍后再次查询任务。"],
+    )
+
+
+def test_day4_answer_schema(day4_answer):
+    """推断与规则都有引用，未知项和后续建议分别记录。"""
+    data = day4_answer.model_dump()
+    assert Day4Answer.model_validate(data) == day4_answer
+    data["inferences"][0]["evidence_ids"] = []
+    with pytest.raises(ValueError, match="evidence_ids"):
+        Day4Answer.model_validate(data)
+
+
+@DAY4
+def test_day4_accepts_current_fact_and_cited_inference(day4_answer, day2_task_results, evidence):
+    success, _ = day2_task_results
+    context = build_day2_context(success, (evidence,))
+    validate_day4_answer(day4_answer, context, requested_task_id="12345")
+
+    # 只问规则时，来自同一知识片段的说明仍可以独立成立。
+    rule_answer = day4_answer.model_copy(update={"current_task": None, "inferences": []})
+    validate_day4_answer(rule_answer, build_day2_context(None, (evidence,)), requested_task_id=None)
+
+
+@DAY4
+def test_day4_current_claim_must_match_both_request_and_api(day4_answer, day2_task_results, evidence):
+    success, _ = day2_task_results
+    context = build_day2_context(success, (evidence,))
+    assert day4_answer.current_task is not None
+    for mismatch in ({"evidence_id": "K1"}, {"task_id": "98765"}, {"state": "FAILED"}):
+        claim = day4_answer.current_task.model_copy(update=mismatch)
+        wrong_answer = day4_answer.model_copy(update={"current_task": claim})
+        with pytest.raises(ValueError, match="当前状态"):
+            validate_day4_answer(wrong_answer, context, requested_task_id="12345")
+
+    for requested in ("98765", None):
+        with pytest.raises(ValueError, match="当前状态"):
+            validate_day4_answer(day4_answer, context, requested_task_id=requested)
+
+
+@DAY4
+def test_day4_historical_case_cannot_establish_current_state():
+    # 合成的历史案例故意包含同一任务编号和明确状态，模拟看似相关的检索结果。
+    history = KnowledgeEvidence("W10D4-HISTORY", "fixture:historical_task",
+                                "历史案例：任务 12345 在 2025 年记录的状态为 FAILED。")
+    missing = BusinessResult(status="error", data=None, error_code="NOT_FOUND")
+    for task_result in (None, missing):
+        context = build_day2_context(task_result, (history,))
+        for evidence_id in ("K1", "T1"):
+            wrong = Day4Answer(
+                current_task=Day4TaskClaim(task_id="12345", state="FAILED", evidence_id=evidence_id),
+                rules=[], inferences=[], unknowns=[], next_steps=[],
+            )
+            with pytest.raises(ValueError, match="当前状态"):
+                validate_day4_answer(wrong, context, requested_task_id="12345")
+
+        unknown = Day4Answer(
+            current_task=None, rules=[], inferences=[], unknowns=["缺少任务 12345 的本轮查询结果。"],
+            next_steps=["通过任务 API 查询当前状态。"],
+        )
+        validate_day4_answer(unknown, context, requested_task_id="12345")
+        with pytest.raises(ValueError, match="unknowns"):
+            validate_day4_answer(unknown.model_copy(update={"unknowns": [" "]}), context,
+                                 requested_task_id="12345")
+
+
+@DAY4
+def test_day4_references_must_use_visible_and_allowed_sources(
+    day4_answer, day2_cases, day2_evidence, day2_task_results,
+):
+    success, _ = day2_task_results
+    context = build_day2_context(success, day2_evidence, max_chars=day2_cases["budgets"]["tight"])
+    assert context.omitted_ids == ("K2",)
+    for field, evidence_id in (("rules", "T1"), ("rules", "K99"), ("inferences", "K2")):
+        claim = Day4GroundedStatement(text="把未核实的内容写成结论。", evidence_ids=["K1", evidence_id])
+        wrong = day4_answer.model_copy(update={field: [claim]})
+        with pytest.raises(ValueError, match="引用"):
+            validate_day4_answer(wrong, context, requested_task_id="12345")

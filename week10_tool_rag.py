@@ -1,4 +1,4 @@
-"""Week10 的路由、证据组装和 Agents SDK 练习。"""
+"""Week10 的路由、证据组装、Agents SDK 和回答证据校验练习。"""
 
 import json
 from collections.abc import Callable, Sequence
@@ -8,6 +8,7 @@ from typing import Literal
 from agents import Agent, ModelSettings, RunConfig, RunContextWrapper, Runner, Session, function_tool
 from agents.models.interface import Model
 from agents.result import RunResult
+from pydantic import BaseModel, ConfigDict, Field
 
 from week6 import BusinessResult
 
@@ -400,3 +401,91 @@ async def run_day3_agent(
     }
     response = await Runner.run(agent, question, **run_options)
     return response
+
+
+class Day4TaskClaim(BaseModel):
+    """关于某个任务当前状态的结论，证据编号来自本轮 API 摘要。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    task_id: str = Field(min_length=1)
+    state: str = Field(min_length=1)
+    evidence_id: str = Field(min_length=1)
+
+
+class Day4GroundedStatement(BaseModel):
+    """一条文档规则或推断，以及所依赖的本轮证据编号。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    text: str = Field(min_length=1)
+    evidence_ids: list[str] = Field(min_length=1)
+
+
+class Day4Answer(BaseModel):
+    """把本轮回答拆成可以分别阅读和校验的五类内容。
+
+    current_task 是回答中的当前状态事实，记录任务编号、状态和本轮 API 证据编号。
+    只问文档规则，或本轮 API 没有查到可确认的状态时，填 None。
+    rules 放文档说明的业务规则，例如 RUNNING 表示执行中，每条引用本轮知识片段。
+    inferences 放从证据得出的判断，例如查到 RUNNING 后推断任务尚未完成。
+    每条推断记录实际用到的 API 事实编号或知识片段编号。
+    unknowns 写明当前证据无法确认的信息，例如预计完成时间未知。用户问当前状态而
+    current_task 为 None 时，至少有一项说明证据缺口。
+    next_steps 给出用户可以采取的动作，例如稍后重新查询当前状态。
+    四个列表都可以用空列表表示没有对应内容，unknowns 仍须满足上述查询场景的要求。
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    current_task: Day4TaskClaim | None
+    rules: list[Day4GroundedStatement]
+    inferences: list[Day4GroundedStatement]
+    unknowns: list[str]
+    next_steps: list[str]
+
+
+def validate_day4_answer(
+    answer: Day4Answer, context: Day2Context, *, requested_task_id: str | None,
+) -> None:
+    """校验本轮结构化回答的证据来源。通过时返回 None，违规时抛出 ValueError。
+
+    context 是 Day2 组装后的本轮证据。只校验实际留在 text 中的编号。
+    requested_task_id 由调用方传入。用户要求核实某个任务当前状态时传该任务编号，
+    只问规则时即使举了任务编号也传 None。
+
+    W10D4-1 检查回答中的 answer.current_task。这个对象是回答声称的当前任务状态，
+    包含 task_id、state、evidence_id。task_fact 则是从 context.text 的 task_query.fact
+    取出的本轮 API 事实。先确认 task_fact 存在，再逐项比较上述三个字段。
+    此外，answer.current_task.task_id 必须等于 requested_task_id，确保回答的是用户所问的任务。
+    任一检查失败就抛出 ValueError，消息应含“当前状态”。
+
+    W10D4-2 检查规则与推断的引用。规则只能引用 knowledge 中的编号。
+    推断可引用 knowledge 中的编号和本轮 API 事实编号。逐条检查每个引用，
+    引用不在允许集合中时抛出 ValueError，消息应含“引用”。
+    """
+    payload = json.loads(context.text)
+    task_query = payload["task_query"]
+    task_fact = task_query["fact"] if task_query is not None else None
+
+    if answer.current_task is not None:
+        # 将 answer.current_task 的三个字段与 task_fact 对照，
+        # 再确认回答的 task_id 等于 requested_task_id。
+        if task_fact is None:
+            raise ValueError("当前状态不匹配")
+        if not (answer.current_task.task_id == task_fact['task_id'] and
+                answer.current_task.state == task_fact['state'] and
+                answer.current_task.evidence_id == task_fact['evidence_id']):
+            raise ValueError("当前状态不匹配")
+        if answer.current_task.task_id != requested_task_id:
+            raise ValueError("当前状态不匹配")
+    if requested_task_id is not None and answer.current_task is None:
+        if not any(item.strip() for item in answer.unknowns):
+            raise ValueError("未核实当前状态，需要在 unknowns 中说明缺少的信息")
+
+    knowledge_ids = {entry["evidence_id"] for entry in payload["knowledge"]}
+    available_ids = knowledge_ids if task_fact is None else knowledge_ids | {task_fact["evidence_id"]}
+    # 规则引用知识片段，推断还可以引用本轮 API 事实。
+    for rule in answer.rules:
+        if not (set(rule.evidence_ids).issubset(set(knowledge_ids))):
+            raise ValueError("引用了错误数据")
+    for inference in answer.inferences:
+        if not (set(inference.evidence_ids).issubset(set(available_ids))):
+            raise ValueError("引用了错误数据")
