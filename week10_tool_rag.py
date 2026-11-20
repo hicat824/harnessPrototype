@@ -1,8 +1,8 @@
-"""Week10 的路由、证据组装、Agents SDK 和回答证据校验练习。"""
+"""Week10 的路由、证据校验、Agents SDK 和多轮任务练习。"""
 
 import json
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 from agents import Agent, ModelSettings, RunConfig, RunContextWrapper, Runner, Session, function_tool
@@ -489,3 +489,97 @@ def validate_day4_answer(
     for inference in answer.inferences:
         if not (set(inference.evidence_ids).issubset(set(available_ids))):
             raise ValueError("引用了错误数据")
+
+
+@dataclass
+class Day5TaskState:
+    """一个待办任务的状态，由调用方在多轮间保留。
+
+    request 保存原问题、意图和已确认的任务编号。max_tool_calls 是整个任务允许的
+    调用次数，tool_calls 记录已开始的调用。last_result 记录上轮结果。只有
+    needs_input 会等待后续补参，其余结果表示本任务已结束。Session 历史另行管理。
+    """
+
+    request: Day1Request
+    max_tool_calls: int = 2
+    tool_calls: int = 0
+    last_result: Day1Result | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.max_tool_calls) is not int or self.max_tool_calls < 0:
+            raise ValueError("max_tool_calls 必须为非负整数")
+
+
+class _Day5ToolBudgetExhausted(Exception):
+    """下一次工具调用超过本任务预算。"""
+
+
+def _accept_day5_task_id(state: Day5TaskState, supplied_task_id: str | None) -> None:
+    """练习 W10D5-1。把用户补答中的任务编号写回待办任务。
+
+    supplied_task_id 由调用方从用户补答中取得。仅当上一轮结果为 needs_input、
+    原请求的 task_id 为 None 或空串、且补答去掉首尾空白后有内容时，才更新 state.request。
+    用 dataclasses.replace 将清理后的编号写入冻结的 Day1Request，保留问题和两种意图。
+    没有用户补答时 supplied_task_id 为 None，上下文摘要不作为任务编号来源。
+    """
+    # 只接受待补参任务的用户补答。
+    empty_request_task_id = state.request.task_id is None or (isinstance(state.request.task_id, str) and not state.request.task_id.strip())
+    valid_supplied_task_id = supplied_task_id is not None and supplied_task_id.strip()
+
+    if state.last_result and state.last_result.status == "needs_input" and empty_request_task_id and valid_supplied_task_id:
+        state.request = replace(state.request, task_id=supplied_task_id.strip())
+
+
+def _consume_day5_tool_call(state: Day5TaskState) -> None:
+    """练习 W10D5-2。每次调用工具前先检查并占用一次任务预算。
+
+    已用次数达到上限时抛出 _Day5ToolBudgetExhausted，调用方据此终止本任务。
+    允许执行时先将 tool_calls 加一。随后工具若返回失败，此次调用也计入预算。
+    """
+    # 调用前先占用预算，失败的调用也计数。
+    if state.tool_calls >= state.max_tool_calls:
+        raise _Day5ToolBudgetExhausted()
+    else:
+        state.tool_calls += 1
+
+
+def run_day5_turn(
+    state: Day5TaskState,
+    *,
+    query_task: Callable[[str], BusinessResult],
+    search_knowledge: Callable[[str], Sequence[KnowledgeEvidence]],
+    supplied_task_id: str | None = None,
+) -> Day1Result:
+    """执行一轮待办任务，支持补参续跑和受控退出。
+
+    缺参时复用 Day1 的 needs_input。权限不足等业务错误会保留原错误码。
+    预算耗尽时返回 error 和 TOOL_BUDGET_EXHAUSTED。已取得的任务事实
+    仍放在结果中，便于调用方区分查询成功与整条组合路径未完成。
+    """
+    if state.last_result is not None and state.last_result.status != "needs_input":
+        return state.last_result
+
+    _accept_day5_task_id(state, supplied_task_id)
+    task_result = None
+
+    def limited_query(task_id: str) -> BusinessResult:
+        nonlocal task_result
+        _consume_day5_tool_call(state)
+        task_result = query_task(task_id)
+        return task_result
+
+    def limited_search(query: str) -> Sequence[KnowledgeEvidence]:
+        _consume_day5_tool_call(state)
+        return search_knowledge(query)
+
+    try:
+        result = run_day1(state.request, query_task=limited_query, search_knowledge=limited_search)
+    except _Day5ToolBudgetExhausted:
+        fact = _extract_task_fact(task_result) if task_result is not None else None
+        result = Day1Result(
+            select_route(state.request), "error", reason="TOOL_BUDGET_EXHAUSTED",
+            task_state=fact["state"] if fact is not None else None,
+            task_source=fact["source"] if fact is not None else None,
+        )
+    state.last_result = result
+    return result

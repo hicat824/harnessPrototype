@@ -1,6 +1,6 @@
 # Week10 · Tool + RAG 协同
 
-**当前进度**　Day1 至 Day4 已完成（2026-11-20）。下一阶段为 Day5 多轮任务、缺参追问与异常退出。
+**当前进度**　Day1 至 Day5 已完成（2026-11-20）。下一阶段为 Day6 分层 Agent Evals。
 
 本周用 Week6 的 Mock 任务查询提供当前状态，用 Week9 的知识库解释静态业务规则。学习重点是决定每个问题需要哪些数据、先取哪一类证据，以及证据不足时如何追问或停止。每阶段的目标以 [V4 学习计划](/home/xumaozhou/Music/agent_engineer_learning_plan_v4_mcp.md#L359) 为准。
 
@@ -12,7 +12,7 @@
 | **Day2（已完成）** | 多来源 Context | 限长后保留查询事实、文档引用与截断标记 |
 | **Day3（已完成）** | Agents SDK 集成 | 用 `Runner` 和 Session 接入 Mock 查询和知识工具，验证 Agent 选路与传参 |
 | **Day4（已完成）** | 证据与不确定性 | 能区分查询事实、文档规则、推断与未知项 |
-| Day5 | 多轮续接与异常退出 | 补参和压缩后继续执行，权限失败或预算耗尽时明确停止 |
+| **Day5（已完成）** | 多轮续接与异常退出 | 补参和压缩后继续执行，权限失败或预算耗尽时明确停止 |
 | Day6 | 分层 Agent Evals | 用至少 30 条混合用例分别评估最终结果和工具调用过程 |
 | Day7 | 周验收 | 同题比较仅工具、仅 RAG 和自动混合路由的质量、耗时与可记录的 Token 用量 |
 
@@ -34,19 +34,19 @@ Day1 完整离线验收 **5 项通过**。 [验收报告](/media/xumaozhou/data/
 
 - **数据来源**　`mock_scenarios.json` 指定 Mock 身份、任务编号和文档位置。业务响应来自 Week6 的 `MockTransport`，知识原文取自 Week9 的 `KB006.md` 第 6 行。
 - **检查点**　`12345` 查询成功并返回 `RUNNING`，`99999` 返回 `NOT_FOUND`，知识原文覆盖状态枚举。
-- **输出**　pytest 结果。 [测试入口](../tests/test_week10_tool_rag.py#L52)
+- **输出**　pytest 结果。 [测试入口](../tests/test_week10_tool_rag.py#L53)
 
 ### 测试二 · 核对组合路由的检索参数
 
 - **数据来源**　测试分别传入 `SUCCESS`、`FAILED` 和 `None`，问题中带有干扰词 `RUNNING`。
 - **检查点**　检索参数跟随实际查到的状态。没有状态时返回 `None`。
-- **输出**　pytest 结果。 [测试入口](../tests/test_week10_tool_rag.py#L66)
+- **输出**　pytest 结果。 [测试入口](../tests/test_week10_tool_rag.py#L67)
 
 ### 测试三 · 核对路由与停止条件
 
 - **数据来源**　`eval_cases.json` 提供三条正常路径和两个停止场景。测试把 `input` 传给执行框架，运行结束后读取 `expected` 评分。
 - **检查点**　记录工具名、参数和调用顺序。缺任务 ID 时零工具调用。组合查询失败时保留错误码并停止检索。组合查询成功时保留 Mock 来源与知识引用。
-- **输出**　默认写入测试目录下的 `runs/day1/routing_report.json`。 [测试入口](../tests/test_week10_tool_rag.py#L115)
+- **输出**　默认写入测试目录下的 `runs/day1/routing_report.json`。 [测试入口](../tests/test_week10_tool_rag.py#L116)
 
 ### 运行验收
 
@@ -74,21 +74,21 @@ Day2 完整离线验收 **4 项通过**，与 Day1 合计 **9 项通过**。紧�
 
 - **数据来源**　`day2_context_cases.json` 指定 Mock 任务 `12345`、不存在的任务 `99999`，以及 Week9 `KB006.md` 第 6、14 行。中间的长片段由样例中的合成文本生成，用于触发预算边界。
 - **检查点**　Mock 状态与错误码正确，文档原文可定位，长片段超过紧预算。
-- **输出**　pytest 结果。 [测试入口](../tests/test_week10_tool_rag.py#L165)
+- **输出**　pytest 结果。 [测试入口](../tests/test_week10_tool_rag.py#L166)
 
 ### 测试二 · 成功查询的摘要
 
-- 用 Week6 Mock 的成功响应验证事实字段、来源和查询时间。给响应加上游截断标记，检查该标记能保留到 Context 中，同时验证输入对象保持原样。输出为 pytest 结果。 [测试入口](../tests/test_week10_tool_rag.py#L176)
+- 用 Week6 Mock 的成功响应验证事实字段、来源和查询时间。给响应加上游截断标记，检查该标记能保留到 Context 中，同时验证输入对象保持原样。输出为 pytest 结果。 [测试入口](../tests/test_week10_tool_rag.py#L177)
 
 ### 测试三 · 无有效任务事实
 
-- 用仅查知识、Mock 返回 `NOT_FOUND` 和字段无效的响应检查引用边界。仅查知识时保留文档证据，查询失败时保留错误码，缺少有效任务事实时不生成 `T1`。输出为 pytest 结果。 [测试入口](../tests/test_week10_tool_rag.py#L197)
+- 用仅查知识、Mock 返回 `NOT_FOUND` 和字段无效的响应检查引用边界。仅查知识时保留文档证据，查询失败时保留错误码，缺少有效任务事实时不生成 `T1`。输出为 pytest 结果。 [测试入口](../tests/test_week10_tool_rag.py#L198)
 
 ### 测试四 · Context 的字符预算
 
 - **数据来源**　复用同一份 Mock 查询结果和三个片段。样例提供宽预算与紧预算，测试另构造恰好容纳完整 Context 和连最小结构都放不下的预算。
 - **检查点**　按实际序列化长度验收。宽预算保留全部，紧预算跳过 `K2` 并保留 `K1`、`K3`。任务事实、原文及引用保持完整，真实遗漏有标记。恰好等于预算也可以纳入。
-- **输出**　通过后默认写入测试数据目录下的 `runs/day2/context_report.json`，记录预算、实际字符数、跳过的编号和各组 Context。 [测试入口](../tests/test_week10_tool_rag.py#L222)
+- **输出**　通过后默认写入测试数据目录下的 `runs/day2/context_report.json`，记录预算、实际字符数、跳过的编号和各组 Context。 [测试入口](../tests/test_week10_tool_rag.py#L223)
 
 ### 运行验收
 
@@ -119,19 +119,19 @@ Day3 离线验收 **3 项通过**，与 Day1、Day2 合计 **12 项通过**。De
 
 ### 测试一 · 工具参数
 
-检查 SDK 生成的工具定义。任务查询接收 `task_id`，知识检索接收 `query`。本地 Context 由 Runner 注入。 [测试入口](../tests/test_week10_tool_rag.py#L259)
+检查 SDK 生成的工具定义。任务查询接收 `task_id`，知识检索接收 `query`。本地 Context 由 Runner 注入。 [测试入口](../tests/test_week10_tool_rag.py#L260)
 
 ### 测试二 · 路由与工具结果
 
-复用 Day1 的五个案例、Week6 Mock 查询和 Week9 知识原文。脚本模型驱动真实 Runner，校验三条正常路径、缺参追问和查询失败停止。组合案例会读取 SDK 返回的实际状态，再形成下一次调用，验收工具参数、顺序和证据是否沿链路传递。通过后保存 `runs/day3/sdk_report.json`。 [测试入口](../tests/test_week10_tool_rag.py#L383)
+复用 Day1 的五个案例、Week6 Mock 查询和 Week9 知识原文。脚本模型驱动真实 Runner，校验三条正常路径、缺参追问和查询失败停止。组合案例会读取 SDK 返回的实际状态，再形成下一次调用，验收工具参数、顺序和证据是否沿链路传递。通过后保存 `runs/day3/sdk_report.json`。 [测试入口](../tests/test_week10_tool_rag.py#L384)
 
 ### 测试三 · 会话续问
 
-连续两轮调用 Runner。第一轮查询任务，第二轮根据同一 Session 中的上轮工具结果回答“我们上一轮查的是哪个任务”。校验续问读到了原任务编号并且没有重复查询。 [测试入口](../tests/test_week10_tool_rag.py#L393)
+连续两轮调用 Runner。第一轮查询任务，第二轮根据同一 Session 中的上轮工具结果回答“我们上一轮查的是哪个任务”。校验续问读到了原任务编号并且没有重复查询。 [测试入口](../tests/test_week10_tool_rag.py#L394)
 
 ### 测试四 · 真实模型自主选路
 
-把三条正常路径的原问题交给 `deepseek-flash`。Runner 执行模型自主选择的工具，业务查询和知识检索继续使用本地样例。验收工具选择、参数、顺序和实际返回的证据。通过后保存 `runs/day3/real_model_report.json`。 [测试入口](../tests/test_week10_tool_rag.py#L426) · [DeepSeek Responses API](https://api-docs.deepseek.com/guides/responses_api/)
+把三条正常路径的原问题交给 `deepseek-flash`。Runner 执行模型自主选择的工具，业务查询和知识检索继续使用本地样例。验收工具选择、参数、顺序和实际返回的证据。通过后保存 `runs/day3/real_model_report.json`。 [测试入口](../tests/test_week10_tool_rag.py#L427) · [DeepSeek Responses API](https://api-docs.deepseek.com/guides/responses_api/)
 
 ### 运行验收
 
@@ -171,23 +171,23 @@ Day4 离线验收 **5 项通过**。覆盖结构化回答、任务身份与状�
 
 ### 测试一 · 回答结构
 
-用本地构造的组合回答验证五类输出可分别读取，并检查推断必须携带引用。结果显示在 pytest 输出中。 [测试入口](../tests/test_week10_tool_rag.py#L459)
+用本地构造的组合回答验证五类输出可分别读取，并检查推断必须携带引用。结果显示在 pytest 输出中。 [测试入口](../tests/test_week10_tool_rag.py#L460)
 
 ### 测试二 · 接受有效证据
 
-复用 Week6 Mock 返回的当前状态与 Week9 的 KB006 文档原文，验证组合回答和仅查规则两种情况。结果显示在 pytest 输出中。 [测试入口](../tests/test_week10_tool_rag.py#L469)
+复用 Week6 Mock 返回的当前状态与 Week9 的 KB006 文档原文，验证组合回答和仅查规则两种情况。结果显示在 pytest 输出中。 [测试入口](../tests/test_week10_tool_rag.py#L470)
 
 ### 测试三 · 拒绝错误的当前状态
 
-用同一份 Mock 查询结果分别改动回答的任务编号、状态或引用，并改动调用方请求的任务编号，验证只有一致的当前事实才能通过。结果显示在 pytest 输出中。 [测试入口](../tests/test_week10_tool_rag.py#L480)
+用同一份 Mock 查询结果分别改动回答的任务编号、状态或引用，并改动调用方请求的任务编号，验证只有一致的当前事实才能通过。结果显示在 pytest 输出中。 [测试入口](../tests/test_week10_tool_rag.py#L481)
 
 ### 测试四 · 历史案例与未知项
 
-用包含相同任务编号的合成历史记录，覆盖无查询和查询失败。校验器应拒绝用历史状态作答，并接受明确说明证据缺口的回答。结果显示在 pytest 输出中。 [测试入口](../tests/test_week10_tool_rag.py#L496)
+用包含相同任务编号的合成历史记录，覆盖无查询和查询失败。校验器应拒绝用历史状态作答，并接受明确说明证据缺口的回答。结果显示在 pytest 输出中。 [测试入口](../tests/test_week10_tool_rag.py#L497)
 
 ### 测试五 · 无效引用
 
-复用 Day2 紧预算样例，验证规则引用任务事实、引用未出现的编号、推断引用被预算跳过的片段都会失败。结果显示在 pytest 输出中。 [测试入口](../tests/test_week10_tool_rag.py#L522)
+复用 Day2 紧预算样例，验证规则引用任务事实、引用未出现的编号、推断引用被预算跳过的片段都会失败。结果显示在 pytest 输出中。 [测试入口](../tests/test_week10_tool_rag.py#L523)
 
 ### 运行验收
 
@@ -195,4 +195,48 @@ Day4 离线验收 **5 项通过**。覆盖结构化回答、任务身份与状�
 
 ```bash
 RUN_WEEK10_DAY4=1 .venv/bin/python -B -m pytest tests/test_week10_tool_rag.py -k day4 -v -s -p no:cacheprovider
+```
+
+## Day5 · 多轮任务、缺参追问与异常退出
+
+Day5 把一次查询扩展成可续接的任务。调用方为每个任务保留一份 `Day5TaskState`，记录原问题、两种意图、任务编号、已用工具次数和上轮结果。Session 保存对话，压缩时归纳旧消息。用户补参后，执行器根据仍在的待办状态继续处理原任务。 [任务状态与执行入口](../week10_tool_rag.py#L495)
+
+- **缺参追问。** 组合任务缺任务编号时返回 `needs_input`，只等用户补答，工具调用次数保持为零。补入编号后，按原来的意图查任务并解释查到的状态。
+- **工具预算。** 任务查询和知识检索各用一次预算。每次调用前检查余额，通过后立即占用一次。预算只有一次时，组合任务可得到任务事实，加查知识时会以 `TOOL_BUDGET_EXHAUSTED` 结束，保留已查到的事实。
+- **不可恢复错误。** 遇到 `FORBIDDEN` 时保留错误码并结束。后续调用同一任务时复用停止结果。新的查询目标由调用方建立新的任务状态。
+- **压缩后续接。** 摘要可以只概括「此前讨论了一项任务」。原问题和追问状态仍由待办对象保存。收到明确的任务编号后继续执行，预算从该任务已用的次数接着算。
+
+Day5 离线验收 **6 项通过**，与 Day1～Day4 合计 **23 项通过**。覆盖带空格的编号补参、零次和一次工具预算、权限失败退出，以及 Session 历史压缩后的待办续接。
+
+### 练习入口
+
+1. **W10D5-1** 在待补参状态下接收用户提供的非空白编号，保留原问题和意图。 [补参实现](../week10_tool_rag.py#L517)
+2. **W10D5-2** 检查下一次调用是否有预算，允许时计数，耗尽时在工具执行前抛出预算异常。 [预算实现](../week10_tool_rag.py#L533)
+
+### 测试一 · 初始化任务预算
+
+用一条本地状态查询验证任务具备独立计数和上轮结果字段。覆盖零预算和非法负预算。 [测试入口](../tests/test_week10_tool_rag.py#L551)
+
+### 测试二 · 追问与补参续跑
+
+复用 Week6 的 `12345` Mock 任务和 KB006 的状态说明。验证缺参和空白补答均保持等待，用户提供编号后按原意图运行两步，完成后再次请求同一任务时复用结果。 [测试入口](../tests/test_week10_tool_rag.py#L560)
+
+### 测试三 · 预算耗尽前停下
+
+对同一组合请求分别给零次和一次预算，核对实际工具次数。零次时在第一步停下，一次时保留任务事实并跳过知识检索。 [测试入口](../tests/test_week10_tool_rag.py#L586)
+
+### 测试四 · 权限错误退出
+
+用 Week6 Mock 的故障编号 `33333` 触发 403。验收保留 `FORBIDDEN`，停止知识检索，并且续轮不会重试已结束的任务。 [测试入口](../tests/test_week10_tool_rag.py#L598)
+
+### 测试五 · 压缩后恢复待办
+
+在本地 SQLite Session 中写入待补参的旧对话，用现有 `compact_session` 和固定摘要确实压缩历史。原始提问被压缩后，验收同一待办对象仍可接受任务编号并完成查询。 [测试入口](../tests/test_week10_tool_rag.py#L612)
+
+### 运行验收
+
+默认检查任务状态初始化。下列命令启用完整 Day5 离线测试，结果显示在 pytest 输出中。
+
+```bash
+RUN_WEEK10_DAY5=1 .venv/bin/python -B -m pytest tests/test_week10_tool_rag.py -k day5 -v -s -p no:cacheprovider
 ```

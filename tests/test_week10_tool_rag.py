@@ -16,6 +16,7 @@ from week10_tool_rag import (
     Day1Request, KnowledgeEvidence, build_day2_context, prepare_knowledge_query, run_day1,
     build_day3_agent, query_task_tool, run_day3_agent, search_knowledge_tool,
     Day4Answer, Day4GroundedStatement, Day4TaskClaim, validate_day4_answer,
+    Day5TaskState, run_day5_turn,
 )
 
 
@@ -530,3 +531,112 @@ def test_day4_references_must_use_visible_and_allowed_sources(
         wrong = day4_answer.model_copy(update={field: [claim]})
         with pytest.raises(ValueError, match="引用"):
             validate_day4_answer(wrong, context, requested_task_id="12345")
+
+
+DAY5 = pytest.mark.skipif(os.environ.get("RUN_WEEK10_DAY5") != "1",
+                         reason="Day5 离线验收需设置 RUN_WEEK10_DAY5=1")
+
+
+@pytest.fixture
+def day5_tools(scenarios, evidence):
+    """复用 Week6 Mock API 和 KB006 文档，记录调用次数与参数。"""
+    from unittest.mock import Mock
+
+    with create_mock_http_client(scenarios["subject_id"]) as client:
+        service = BusinessService(BusinessAPIClient(client))
+        yield {"query_task": Mock(wraps=service.query_task),
+               "search_knowledge": Mock(return_value=(evidence,))}
+
+
+def test_day5_task_state_starts_with_an_unused_budget():
+    request = Day1Request("任务 12345 现在是什么状态？", True, False, "12345")
+    state = Day5TaskState(request, max_tool_calls=0)
+    assert state.tool_calls == 0 and state.last_result is None
+    with pytest.raises(ValueError, match="max_tool_calls"):
+        Day5TaskState(request, max_tool_calls=-1)
+
+
+@DAY5
+def test_day5_asks_then_resumes_with_the_supplied_task_id(day5_tools):
+    request = Day1Request("任务现在是什么状态？也解释一下状态的含义。", True, True)
+    state = Day5TaskState(request)
+    first = run_day5_turn(state, **day5_tools)
+    assert first.status == "needs_input" and first.reason == "MISSING_PARAMETER"
+    assert run_day5_turn(state, supplied_task_id=" ", **day5_tools).status == "needs_input"
+    assert state.tool_calls == 0
+    day5_tools["query_task"].assert_not_called()
+    day5_tools["search_knowledge"].assert_not_called()
+
+    result = run_day5_turn(state, supplied_task_id=" 12345 ", **day5_tools)
+    assert (result.route, result.status, result.task_state) == ("tool_rag", "answered", "RUNNING")
+    assert state.request.question == request.question
+    assert state.request.needs_current_state and state.request.needs_rule
+    assert state.request.task_id == "12345" and state.tool_calls == 2
+    day5_tools["query_task"].assert_called_once_with("12345")
+    day5_tools["search_knowledge"].assert_called_once()
+    assert "RUNNING" in day5_tools["search_knowledge"].call_args.args[0]
+
+    assert run_day5_turn(state, supplied_task_id="99999", **day5_tools) == result
+    assert state.request.task_id == "12345"
+    assert day5_tools["query_task"].call_count == day5_tools["search_knowledge"].call_count == 1
+
+
+@DAY5
+@pytest.mark.parametrize("max_calls, observed_state", [(0, None), (1, "RUNNING")])
+def test_day5_budget_stops_before_the_next_tool(max_calls, observed_state, day5_tools):
+    request = Day1Request("任务 12345 当前是什么状态？解释这个状态。", True, True, "12345")
+    state = Day5TaskState(request, max_tool_calls=max_calls)
+    result = run_day5_turn(state, **day5_tools)
+    assert (result.status, result.reason, result.task_state) == (
+        "error", "TOOL_BUDGET_EXHAUSTED", observed_state,
+    )
+    assert state.tool_calls == day5_tools["query_task"].call_count == max_calls
+    day5_tools["search_knowledge"].assert_not_called()
+
+
+@DAY5
+def test_day5_permission_failure_ends_the_task_without_retry(day5_tools):
+    # Week6 Mock 使用任务编号 33333 触发 HTTP 403。
+    request = Day1Request("任务 33333 是什么状态？解释查到的状态。", True, True, "33333")
+    state = Day5TaskState(request)
+    result = run_day5_turn(state, **day5_tools)
+    assert (result.status, result.reason, result.task_state) == ("error", "FORBIDDEN", None)
+    assert run_day5_turn(state, supplied_task_id="12345", **day5_tools) == result
+    assert state.tool_calls == 1
+    day5_tools["query_task"].assert_called_once_with("33333")
+    day5_tools["search_knowledge"].assert_not_called()
+
+
+@DAY5
+@pytest.mark.asyncio
+async def test_day5_resumes_after_compacting_session_history(day5_tools):
+    from contextCompact import compact_session
+
+    request = Day1Request("查一个任务的当前状态，顺带解释状态含义。", True, True)
+    state = Day5TaskState(request)
+    session = SQLiteSession("week10-day5")
+    try:
+        first = run_day5_turn(state, **day5_tools)
+        assert first.status == "needs_input"
+        await session.add_items([
+            {"role": "user", "content": request.question + "这是补充背景。" * 40},
+            {"role": "assistant", "content": "请提供任务编号。"},
+            {"role": "user", "content": "稍等。"},
+            {"role": "assistant", "content": "好的。"},
+        ])
+
+        async def summarize(old_history):
+            assert request.question in old_history
+            return {"summary": "此前讨论了一项任务。", "tokens": 8}
+
+        report = await compact_session(session, summarize, keep_recent_turns=1, force=True, reserved_tokens=0)
+        assert report["compacted"] and report["after"] < report["before"]
+        assert request.question not in json.dumps(await session.get_items(), ensure_ascii=False)
+
+        result = run_day5_turn(state, supplied_task_id="12345", **day5_tools)
+        assert (result.status, result.route, result.task_state) == ("answered", "tool_rag", "RUNNING")
+        assert state.request.question == request.question and state.tool_calls == 2
+        day5_tools["query_task"].assert_called_once_with("12345")
+        day5_tools["search_knowledge"].assert_called_once()
+    finally:
+        session.close()
