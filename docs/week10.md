@@ -1,6 +1,6 @@
 # Week10 · Tool + RAG 协同
 
-**当前进度**　Day1 至 Day6 已完成（2026-11-20），下一阶段为 Day7 周验收。
+**当前进度**　Week10 Day1 至 Day7 已完成（2026-11-20）。全周离线回归 30 项通过。
 
 本周用 Week6 的 Mock 任务查询提供当前状态，用 Week9 的知识库解释静态业务规则。学习重点是决定每个问题需要哪些数据、先取哪一类证据，以及证据不足时如何追问或停止。每阶段的目标以 [V4 学习计划](/home/xumaozhou/Music/agent_engineer_learning_plan_v4_mcp.md#L359) 为准。
 
@@ -14,7 +14,13 @@
 | **Day4（已完成）** | 证据与不确定性 | 能区分查询事实、文档规则、推断与未知项 |
 | **Day5（已完成）** | 多轮续接与异常退出 | 补参和压缩后继续执行，权限失败或预算耗尽时明确停止 |
 | **Day6（已完成）** | 分层 Agent Evals | 用至少 30 条混合用例分别评估最终结果和工具调用过程 |
-| Day7 | 周验收 | 同题比较仅工具、仅 RAG 和自动混合路由的质量、耗时与可记录的 Token 用量 |
+| **Day7（已完成）** | 周验收 | 同题比较仅工具、仅 RAG 和自动混合路由的质量、耗时与可记录的 Token 用量 |
+
+## 本周总结
+
+- **选路和证据。** 当前状态来自业务查询，业务规则来自知识库。组合问题先查任务，再用查到的状态检索对应规则。送给模型的 Context 保留可核验来源、证据编号和截断标记。
+- **多轮执行。** 缺任务编号时先追问，收到补答后继续原任务。权限错误或预算耗尽时停止，待办状态可在 Session 历史压缩后继续使用。
+- **评估。** Day6 将工具选择、传参和召回归入 Trajectory，将停止状态、来源支持和答复完整性归入 Outcome。Day7 复用同一标准，比较三种工具配置对同一批题的影响。
 
 ## Day1 · 路由与任务阶段
 
@@ -315,3 +321,39 @@ RUN_WEEK10_DAY6=1 .venv/bin/python -B -m pytest tests/test_week10_tool_rag.py -k
 ```
 
 测试默认从 `/media/xumaozhou/data/AI/local_agent_test/week10_tool_rag/` 读数据。可用 `WEEK10_DATASET`、`WEEK9_RAG_DATASET` 覆盖输入目录，用 `WEEK10_DAY6_OUTPUT` 覆盖报告目录。
+
+## Day7 · Tool + RAG 周验收
+
+Day6 学会给一次执行打分。Day7 用这套评分标准回答一个问题：允许 Agent 同时使用任务查询和知识检索，在哪些题上能补全证据，代价是多少？从 Day6 固定集中取四道单轮题，每道题交给同一个 Day3 Agent 配置运行三次。三次都用同一问题、指令、工具实现和参考答案；每次从空上下文开始，只改变 Agent 可调用的工具。
+
+Day7 离线验收 **3 项通过**。同一组四题各跑三种策略，共 12 次 Mock 运行。仅工具通过 **2/4**，仅 RAG **1/4**，混合模式 **4/4**。组合题体现了两种来源的互补性。仅工具能确认状态，混合模式还能提供规则依据。真实模型同题结果和 Token 用量待实测。[Day7 Mock 对照报告](/media/xumaozhou/data/AI/local_agent_test/week10_tool_rag/runs/day7/mock/comparison_report.md)
+
+### 工具配置
+
+`day7_tools_for_mode(mode)` 将实验条件转换为 SDK 的 `Agent.tools`。仅工具模式注册任务查询对象，仅 RAG 模式注册知识搜索对象，混合模式注册两者。未知模式在注册前抛出 `ValueError`。注册完成后，模型根据原问题选择实际要调用的工具。[工具配置实现](../week10_tool_rag.py#L769)
+
+### 测试一 · 固定题目
+
+从已有的 `day6_eval_cases.json` 复用 W10D6-01、07、17、20，分别覆盖只查当前状态、只问规则、查状态并解释、任务不存在。测试核对类别和轮次。第 20 题在查询返回 `NOT_FOUND` 后正确停止也算通过。
+
+### 测试二 · 核对工具注册
+
+测试分别输入 `tool_only`、`rag_only`、`hybrid`，检查返回的工具对象与该模式一致。未知模式应抛出 `ValueError`。这一步保证后面的差异确实来自可用工具的变化。
+
+### 测试三 · 离线比较质量与耗时
+
+测试用脚本模型走实际 SDK Runner。工具读取 Week6 Mock API 和 Week9 KB006 文档，脚本依据实际工具返回构造 Day4 格式的答复，并附上处理状态和停止原因。每轮按 Day6 评分器核对实际调用和答复。四题上，仅工具能答全状态题和未找到题，仅 RAG 能答全规则题，混合模式四题均应通过。测试还检查单一来源时的答复能得到已有证据支持。
+
+```bash
+RUN_WEEK10_DAY7=1 .venv/bin/python -B -m pytest tests/test_week10_tool_rag.py -k 'day7 and not real' -v -s -p no:cacheprovider
+```
+
+### 测试四 · 真实模型同题比较
+
+沿用 Day3 的 DeepSeek 配置，真实模型只收到自然语言问题和当前可用工具。业务数据、题目、预算及评分器与离线路径一致。三种模式共 12 次独立运行，每次最多 4 轮。验收要求全部运行成功，混合模式四题通过。单一模式的缺项进入对照报告。
+
+```bash
+RUN_WEEK10_DAY7_LLM=1 .venv/bin/python -B -m pytest tests/test_week10_tool_rag.py::test_day7_real_paired_comparison -v -s -p no:cacheprovider
+```
+
+**怎样读报告。** 在本周测试数据目录的 `runs/day7/mock/` 或 `runs/day7/real_model/` 打开 `comparison_report.md` 看整题通过数、平均耗时、总 Token 和逐题失败项。再看同目录的 `comparison_report.json`，用同一题的实际调用、证据和答复定位差异。分项通过率按完成执行的题统计，执行异常单列并计入整题失败。耗时包含工具与模型调用；Mock 用量或缺少实测数据时，总 Token 为 `null`。每组四题的单次耗时用于本次对照，真实回答的推断和建议可对照原文复核。可用 `WEEK10_DAY7_OUTPUT` 更改报告目录。

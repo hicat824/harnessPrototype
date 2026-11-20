@@ -1,5 +1,6 @@
-"""Week10 验收。离线路径和 Day3 真实模型路径通过各自的开关启用。"""
+"""Week10 验收。离线用例与 Day3、Day7 的真实模型对照分别启用。"""
 
+import asyncio
 import json
 import os
 from dataclasses import asdict, replace
@@ -14,11 +15,13 @@ from agents.tracing.provider import DefaultTraceProvider
 
 from week6 import BusinessAPIClient, BusinessResult, BusinessService, create_mock_http_client
 from week10_tool_rag import (
-    Day1Request, KnowledgeEvidence, build_day2_context, prepare_knowledge_query, run_day1,
+    Day1Request, Day1Result, KnowledgeEvidence, prepare_knowledge_query, run_day1, select_route,
+    Day2Context, build_day2_context,
     build_day3_agent, query_task_tool, run_day3_agent, search_knowledge_tool,
     Day4Answer, Day4GroundedStatement, Day4TaskClaim, validate_day4_answer,
     Day5TaskState, run_day5_turn,
     Day6ExpectedTurn, Day6ToolCall, grade_day6_outcome, grade_day6_trajectory,
+    Day7Answer, day7_tools_for_mode, run_day7_agent,
 )
 
 
@@ -831,3 +834,164 @@ def test_day6_mock_evals_report_outcome_and_trajectory(day6_dataset):
     path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"Day6 Mock 分层评估报告：{path}")
     assert not failed, failed
+
+
+DAY7 = pytest.mark.skipif(os.environ.get("RUN_WEEK10_DAY7") != "1",
+                          reason="Day7 离线验收需设置 RUN_WEEK10_DAY7=1")
+DAY7_OUTPUT = Path(os.environ.get("WEEK10_DAY7_OUTPUT", DATASET / "runs/day7"))
+DAY7_CASE_IDS = ("W10D6-01", "W10D6-07", "W10D6-17", "W10D6-20")
+DAY7_MODES = ("tool_only", "rag_only", "hybrid")
+
+
+def _day7_cases(dataset):
+    by_id = {case["case_id"]: case for case in dataset["cases"]}
+    return [by_id[case_id] for case_id in DAY7_CASE_IDS]
+
+
+def test_day7_paired_questions(day6_dataset):
+    cases = _day7_cases(day6_dataset)
+    assert [case["category"] for case in cases] == ["tool_only", "rag_only", "tool_rag", "stops"]
+    assert all(len(case["expected_turns"]) == 1 for case in cases)
+
+
+@DAY7
+def test_day7_registered_tools_match_experiment():
+    assert day7_tools_for_mode("tool_only") == [query_task_tool]
+    assert day7_tools_for_mode("rag_only") == [search_knowledge_tool]
+    assert day7_tools_for_mode("hybrid") == [query_task_tool, search_knowledge_tool]
+    with pytest.raises(ValueError):
+        day7_tools_for_mode("unknown")
+
+
+def _day7_script(request):
+    """模拟模型根据本次注册的工具和真实工具输出行动。参考答案只由评分器读取。"""
+    def respond(call):
+        available = {tool.name for tool in call.tools}
+        payload = {"task_query": None, "knowledge": [], "knowledge_truncated": False}
+        if isinstance(call.input, list) and any(item.get("type") == "function_call_output" for item in call.input):
+            payload = _day3_last_tool_context(call)
+        task = payload["task_query"]
+        fact = task["fact"] if task else None
+        if request.needs_current_state and task is None and "query_task" in available:
+            return [function_call("query_task", {"task_id": request.task_id}, call_id="task")]
+        can_search = not request.needs_current_state or fact is not None
+        searched = isinstance(call.input, list) and any(item.get("call_id") == "knowledge" for item in call.input)
+        if request.needs_rule and can_search and not searched and "search_knowledge" in available:
+            query = request.question if fact is None else f"{fact['state']} 状态的业务含义是什么？"
+            return [function_call("search_knowledge", {"query": query}, call_id="knowledge")]
+
+        status, reason = "answered", None
+        if task and task["error_code"]:
+            status, reason = "error", task["error_code"]
+        elif (request.needs_current_state and not fact) or (request.needs_rule and not payload["knowledge"]):
+            status, reason = "insufficient", "SOURCE_UNAVAILABLE"
+        result = Day1Result(select_route(request), status, reason)
+        context = Day2Context(json.dumps(payload, ensure_ascii=False), 6000, ())
+        evidence_answer = _day6_mock_answer(result, context)
+        answer = Day7Answer(**evidence_answer.model_dump(), status=status, reason=reason)
+        return [assistant_message(answer.model_dump_json())]
+
+    return ScriptedModel([{"responder": respond} for _ in range(3)])
+
+
+async def _day7_compare(dataset, model, output):
+    """同题同参考逐格评分，单条运行失败也落盘。只在供应商提供用量时汇总 Token。"""
+    catalog = _day6_catalog(dataset)
+    rows = []
+    for case in _day7_cases(dataset):
+        request = Day1Request(**case["input"]["request"])
+        for mode in DAY7_MODES:
+            row = {"case_id": case["case_id"], "question": request.question, "mode": mode,
+                   "usage": None, "failed_checks": []}
+            rows.append(row)
+            current_model = model if model is not None else _day7_script(request)
+            with create_mock_http_client(case["input"].get("subject_id", "alice")) as client:
+                service = BusinessService(BusinessAPIClient(client))
+                started = perf_counter()
+                try:
+                    answer, calls, context, usage = await asyncio.wait_for(run_day7_agent(
+                        current_model, mode, request.question, query_task=service.query_task,
+                        search_knowledge=lambda q: tuple(hit for hit, terms in catalog if any(t in q for t in terms)),
+                    ), timeout=120)
+                except NotImplementedError:
+                    raise
+                except Exception as error:
+                    row.update(execution_error=type(error).__name__, failed_checks=["execution"])
+                    continue
+                finally:
+                    row["elapsed_seconds"] = perf_counter() - started
+            if model is not None and usage.total_tokens > 0:
+                row["usage"] = {"input": usage.input_tokens, "output": usage.output_tokens, "total": usage.total_tokens}
+
+            # 三种策略按原题的完整需求评分。受限模式只答对一部分也会留下具体失败项。
+            expected = Day6ExpectedTurn(**case["expected_turns"][0])
+            result = Day1Result(select_route(request), answer.status, answer.reason)
+            trajectory = grade_day6_trajectory(calls, expected)
+            outcome = grade_day6_outcome(result, answer, context, expected,
+                                         requested_task_id=request.task_id if request.needs_current_state else None)
+            row.update(calls=[asdict(call) for call in calls], answer=answer.model_dump(),
+                       context=json.loads(context.text), trajectory=trajectory, outcome=outcome)
+            row["failed_checks"] = [f"{layer}.{key}" for layer, scores in (("trajectory", trajectory), ("outcome", outcome))
+                                    for key, passed in scores.items() if passed is False]
+
+    summary = {}
+    for mode in DAY7_MODES:
+        group = [row for row in rows if row["mode"] == mode]
+        # 复用 Day6 汇总的适用分母。执行异常单独计数，并在整题通过率中计作失败。
+        completed = [{"turns": [row]} for row in group if "outcome" in row]
+        summary[mode] = {
+            "passed": sum(not row["failed_checks"] for row in group), "cases": len(group),
+            "execution_errors": len(group) - len(completed),
+            "metrics_on_completed": _day6_metrics(completed) if completed else {},
+            "mean_elapsed_seconds": sum(row["elapsed_seconds"] for row in group) / len(group),
+            "total_tokens": sum(row["usage"]["total"] for row in group) if all(row["usage"] for row in group) else None,
+        }
+    path = DAY7_OUTPUT / output / "comparison_report.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"mode": output, "summary": summary, "cases": rows}, ensure_ascii=False,
+                               indent=2) + "\n", encoding="utf-8")
+    lines = ["# Week10 Day7 同题对照", "", f"运行方式为 `{output}`，每种策略使用相同的四道题。",
+             "", "| 策略 | 整题通过 | 平均耗时（秒） | 总 Token |",
+             "|---|---:|---:|---:|"]
+    for mode, data in summary.items():
+        tokens = data["total_tokens"] if data["total_tokens"] is not None else "无实测数据"
+        lines.append(f"| {mode} | {data['passed']}/{data['cases']} | {data['mean_elapsed_seconds']:.3f} | {tokens} |")
+    lines.extend(["", "## 逐题检查", "", "| 题号 | 策略 | 失败项 |", "|---|---|---|"])
+    for row in rows:
+        detail = row.get("execution_error") or "、".join(row["failed_checks"]) or "通过"
+        lines.append(f"| {row['case_id']} | {row['mode']} | {detail} |")
+    lines.extend(["", "调用参数、引用原文和分项指标见 [逐题数据](comparison_report.json)。"])
+    path.with_suffix(".md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"Day7 同题对照报告：{path.with_suffix('.md')}")
+    return rows, summary
+
+
+@DAY7
+@pytest.mark.usefixtures("day3_local_tracing")
+@pytest.mark.asyncio
+async def test_day7_offline_paired_comparison(day6_dataset):
+    rows, summary = await _day7_compare(day6_dataset, None, "mock")
+    assert len(rows) == 12
+    assert all("execution_error" not in row and row["usage"] is None for row in rows)
+    assert {mode: summary[mode]["passed"] for mode in DAY7_MODES} == {"tool_only": 2, "rag_only": 1, "hybrid": 4}
+    for row in rows:
+        allowed = {tool.name for tool in day7_tools_for_mode(row["mode"])}
+        assert all(call["name"] in allowed for call in row["calls"])
+        assert row["outcome"]["source_support"], (row["case_id"], row["mode"])
+
+
+@pytest.mark.skipif(os.environ.get("RUN_WEEK10_DAY7_LLM") != "1",
+                    reason="真实同题对照需单独启用 RUN_WEEK10_DAY7_LLM=1")
+@pytest.mark.usefixtures("day3_local_tracing")
+@pytest.mark.asyncio
+async def test_day7_real_paired_comparison(day6_dataset):
+    from agents import OpenAIResponsesModel
+    from openai import AsyncOpenAI
+
+    assert os.environ.get("OPENAI_API_KEY"), "缺少项目现有的 DeepSeek OPENAI_API_KEY"
+    async with AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"], base_url="https://api.deepseek.com",
+                           timeout=60, max_retries=0) as client:
+        model = OpenAIResponsesModel(model="deepseek-flash", openai_client=client)
+        rows, _ = await _day7_compare(day6_dataset, model, "real_model")
+    assert not [row["case_id"] + "/" + row["mode"] for row in rows if "execution_error" in row]
+    assert not [row["case_id"] for row in rows if row["mode"] == "hybrid" and row["failed_checks"]]

@@ -6,6 +6,8 @@ from dataclasses import dataclass, replace
 from typing import Literal
 
 from agents import Agent, ModelSettings, RunConfig, RunContextWrapper, Runner, Session, function_tool
+from agents.tool import FunctionTool
+from agents.usage import Usage
 from agents.models.interface import Model
 from agents.result import RunResult
 from pydantic import BaseModel, ConfigDict, Field
@@ -752,3 +754,72 @@ def grade_day6_outcome(
         "source_support": source_support,
         "final_answer": final_answer,
     }
+
+
+class Day7Answer(Day4Answer):
+    """沿用 Day4 的证据字段，并让模型明确本轮的处理状态和停止原因。"""
+
+    status: Outcome
+    reason: str | None
+
+
+Day7Mode = Literal["tool_only", "rag_only", "hybrid"]
+
+
+def day7_tools_for_mode(mode: Day7Mode) -> list[FunctionTool]:
+    """W10D7-1 给同一个 Agent 配置实验允许使用的 SDK 工具。
+
+    输入 mode 是评估者选的实验条件，与题目内容无关。输出是 Agent.tools 接收的
+    FunctionTool 对象列表。query_task_tool 查询当前任务，search_knowledge_tool 查静态规则。
+    tool_only 返回仅含前者的列表，rag_only 返回仅含后者的列表，
+    hybrid 按上述顺序返回两者。列表顺序只用于注册，实际调用顺序由模型决定。
+    字符串名称供报告展示，此函数须返回已注册的工具对象本身。
+    遇到其余模式抛出 ValueError，以免静默改变对照条件。
+    """
+    if mode == "tool_only":
+        tools = [query_task_tool]
+    elif mode == "rag_only":
+        tools = [search_knowledge_tool]
+    elif mode == "hybrid":
+        tools = [query_task_tool, search_knowledge_tool]
+    else:
+        raise ValueError(f"未知的 Day7 实验模式：{mode}")
+
+    return tools
+
+
+async def run_day7_agent(
+    model: Model, mode: Day7Mode, question: str, *,
+    query_task: Callable[[str], BusinessResult],
+    search_knowledge: Callable[[str], Sequence[KnowledgeEvidence]],
+) -> tuple[Day7Answer, list[Day6ToolCall], Day2Context, Usage]:
+    """运行一题的单个策略，返回结构化回答、实际调用、证据 Context 和 SDK 用量。
+
+    每次调用创建独立的 Agent 和 RunContext，避免前一个策略的证据进入下一次运行。
+    工具实现、消息指令、证据预算保持一致。回调在工具真正执行时记录参数和召回。
+    """
+    agent = build_day3_agent(model).clone(
+        tools=day7_tools_for_mode(mode), output_type=Day7Answer,
+        instructions=DAY3_INSTRUCTIONS + """
+按当前可用工具工作。组合请求须先取得当前事实才能解释查到的状态。
+证据不全时保留已确认的部分，在 unknowns 说明缺口。缺少必要工具时返回
+insufficient / SOURCE_UNAVAILABLE。业务查询报错时返回 error 和工具给出的错误码。
+回答完整时返回 answered，reason 为 null。rules 每条引用一个知识编号并复制对应片段原文。
+""",
+    )
+    calls = []
+
+    def recorded_query(task_id: str) -> BusinessResult:
+        calls.append(Day6ToolCall("query_task", {"task_id": task_id}))
+        return query_task(task_id)
+
+    def recorded_search(query: str) -> Sequence[KnowledgeEvidence]:
+        hits = tuple(search_knowledge(query))
+        calls.append(Day6ToolCall("search_knowledge", {"query": query}, tuple(hit.source for hit in hits)))
+        return hits
+
+    state = Day3RunContext(recorded_query, recorded_search, 6000)
+    run = await Runner.run(agent, question, context=state, max_turns=4,
+                           run_config=RunConfig(tracing_disabled=True))
+    context = build_day2_context(state.task_result, state.evidence or (), max_chars=state.max_chars)
+    return run.final_output_as(Day7Answer, raise_if_incorrect_type=True), calls, context, run.context_wrapper.usage
