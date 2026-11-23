@@ -1,6 +1,6 @@
 # Week11 · LangGraph 专项学习
 
-**当前进度**　Day1 至 Day6 已完成（2026-11-23），下一阶段为 Day7 框架对比与验收。本周用 Week6 的 Mock API 练习显式的只读查询工作流。[V4 学习计划](/home/xumaozhou/Music/agent_engineer_learning_plan_v4_mcp.md#L375)
+**当前进度**　Week11 已完成（2026-11-23）。本周用 Week6 的 Mock API 验证了只读工作流的路由、失败处理、持久化和人工续接，并用相同业务用例对照了 LangGraph 和 Agents SDK。[V4 学习计划](/home/xumaozhou/Music/agent_engineer_learning_plan_v4_mcp.md#L375)
 
 ## Day1 · State、节点与边
 
@@ -261,3 +261,50 @@ Day6 离线验收 **5 项通过**，Day1 至 Day6 离线回归 **28 项通过**�
 ```bash
 RUN_WEEK11_DAY6=1 .venv/bin/python -B -m pytest tests/test_week11_day6.py -v -p no:cacheprovider
 ```
+
+## Day7 · 框架对比与周验收
+
+用同一组 Mock 业务问题比较两条已有路径。LangGraph 复用 Day5 的只读查询图，由节点和条件边决定直接查还是先追问。Agents SDK 复用 Week10 的 Agent 和查询工具，由真实 `Runner` 执行工具调用。离线脚本模型根据实际用户消息发起查询，再根据实际工具结果生成结构化业务结论。[Day5 查询图](../langgraph_learning/day5.py#L70) · [Week10 Agent](../week10_tool_rag.py#L361)
+
+| 对照维度 | LangGraph 路径 | Agents SDK 路径 |
+|---|---|---|
+| 编排 | 有编号时走 `parse → query → answer`，缺参时进入 `ask_task_id` | 第一轮有编号时发起 `query_task`，缺参时返回追问，补答后再发起工具调用 |
+| 人工补参 | 用相同 `thread_id` 和 `Command(resume=编号)` 恢复待执行节点 | 第一轮完成后，用相同会话开启第二轮，输入只有补答 |
+| 数据持久化 | Checkpointer 保存原问题、辅助字段、查询结果和待执行节点 | 本练习使用 Session 保存对话消息和工具调用记录，下一轮 Runner 加载历史 |
+| 测试关注点 | 核对节点更新、暂停点和最终业务 State | 核对 Run 事件、工具参数和历史是否影响下一轮行为 |
+
+两侧都在追问之后关闭 SQLite，再打开原数据库继续。Week11 Day6 练的是**先查后确认**，今天用 Day5 的**先补参再查**对照同一个业务结果。[LangGraph 恢复执行](https://docs.langchain.com/oss/python/langgraph/interrupts#resuming-interrupts) · [Agents SDK Session](https://openai.github.io/openai-agents-python/sessions/#core-session-behavior)
+
+### 业务结果判定
+
+`compare_outcomes` 接收三份 `QueryOutcome`，每份都包含查询是否成功、任务编号、任务运行状态和错误码。先将两侧各自与独立的预期结果比较，再比较两侧是否一致。比如预期 `RUNNING`，两侧都给出 `SUCCESS`，报告会记录两侧都错、两侧一致。验收还检查实际工具调用次数和从数据库续接的结果。[判定实现](../langgraph_learning/day7.py#L48)
+
+### 测试一 · 对照数据来源
+
+`day7_cases.json` 指定三组对照，引用 Day1 的成功和错误预期。缺参用例的原问题和人工补答沿用 Day5，测试先确认补答与引用的任务编号一致。[Day7 数据](/media/xumaozhou/data/AI/local_agent_test/week11_langgraph/day7_cases.json)
+
+### 测试二 · 业务结果判定
+
+用固定的 `RUNNING` 和错误的 `SUCCESS` 结果覆盖四种组合，分别检查两边均正确、任一边错误和两边都错却一致。测试只检查判定逻辑。
+
+### 测试三 · 框架对照与恢复
+
+| 场景 | 验收行为 |
+|---|---|
+| 正常查询 `12345` | 各查询一次，两边得到 `RUNNING` |
+| 缺参后补答 `23456` | 第一轮都只追问，重开 SQLite 后只提交编号，第二轮各查询一次，得到 `SUCCESS` |
+| 查询不存在的任务 `99999` | 各查询一次，以 `NOT_FOUND` 结束 |
+
+完整测试检查两侧实际轨迹、逐轮查询次数、业务结果和重新打开数据库后读回的原问题。报告展示本实验中的编排、持久化、人工补参和测试检查点。选型时结合业务是否需要指定恢复位置，以及后续步骤由固定规则还是由模型选择。
+
+### 运行验收
+
+Day7 离线验收 **6 项通过**。三组对照中，两侧均返回预期结果，正常查询与任务不存在的场景各查询一次，缺参场景首轮零查询、补答后各查询一次。Week11 全周离线回归 **34 项通过**。
+
+在项目根目录运行。本组使用 Mock HTTP 与离线脚本模型。
+
+```bash
+RUN_WEEK11_DAY7=1 .venv/bin/python -B -m pytest tests/test_week11_day7.py -v -s -p no:cacheprovider
+```
+
+测试会打印产物目录。其中 `state_graph.mmd` 是本次复用的 Day5 状态图，`langgraph.sqlite` 和 `agents_sdk.sqlite` 保存两侧的执行数据，`comparison_report.md` 和 `comparison_report.json` 分别用于阅读结论与查看逐轮证据。[验收脚本](../tests/test_week11_day7.py)
