@@ -1,6 +1,6 @@
 # Week11 · LangGraph 专项学习
 
-**当前进度**　Day1 至 Day4 已完成（2026-11-23），下一阶段为 Day5 Interrupt / Resume 与 Human-in-the-loop。本周用 Week6 的 Mock API 练习显式的只读查询工作流。[V4 学习计划](/home/xumaozhou/Music/agent_engineer_learning_plan_v4_mcp.md#L375)
+**当前进度**　Day1 至 Day5 已完成（2026-11-23），下一阶段为 Day6 工具副作用与恢复测试。本周用 Week6 的 Mock API 练习显式的只读查询工作流。[V4 学习计划](/home/xumaozhou/Music/agent_engineer_learning_plan_v4_mcp.md#L375)
 
 ## Day1 · State、节点与边
 
@@ -137,7 +137,7 @@ RUN_WEEK11_DAY3=1 .venv/bin/python -B -m pytest tests/test_week11_day3.py -v -p 
 
 ## Day4 · Checkpointer、Thread 和持久化
 
-Day4 给已经完成的 Day1 查询图接入 SQLite Checkpointer。仍然走 `parse → query → answer`，执行期间自动保存各阶段的 State。比如在同一线程先查任务 `12345`，再查任务 `23456`。读取最新快照会得到第二个任务，读取第一个任务对应的 `checkpoint_id` 可以看到当时保存的状态。查看快照只访问数据库，业务 API 调用发生在 `invoke` 执行图时。[Day4 代码](../langgraph_learning/day4.py#L40) · [LangGraph Checkpointers](https://docs.langchain.com/oss/python/langgraph/checkpointers)
+Day4 给已经完成的 Day1 查询图接入 SQLite Checkpointer。仍然走 `parse → query → answer`，执行期间自动保存各阶段的 State。比如在同一线程先查任务 `12345`，再查任务 `23456`。读取最新快照会得到第二个任务，读取第一个任务对应的 `checkpoint_id` 可以看到当时保存的状态。查看快照只访问数据库，业务 API 调用发生在 `invoke` 执行图时。[Day4 代码](../langgraph_learning/day4.py#L49) · [LangGraph Checkpointers](https://docs.langchain.com/oss/python/langgraph/checkpointers)
 
 | 概念 | 在 Day4 中的作用 |
 |---|---|
@@ -170,4 +170,47 @@ Day4 离线验收 **5 项通过**，包括历史快照、线程隔离和跨进�
 
 ```bash
 RUN_WEEK11_DAY4=1 .venv/bin/python -B -m pytest tests/test_week11_day4.py -v -p no:cacheprovider
+```
+
+## Day5 · Interrupt / Resume 与人工补参
+
+Day5 让图在缺少任务编号时把控制交给用户。比如用户提出「请帮我查一下任务的当前状态」，首次 `invoke` 到达 `ask_task_id`，调用端从 `__interrupt__` 取得追问，Checkpointer 保存原问题和待执行节点。用户补答「23456」后，调用端以同一个 `thread_id` 调用 `graph.invoke(Command(resume="23456"), config)`。恢复调用只携带补答，原问题从检查点读取。[Day5 图构建](../langgraph_learning/day5.py#L70) · [LangGraph Interrupts](https://docs.langchain.com/oss/python/langgraph/interrupts)
+
+```mermaid
+flowchart LR
+    S([START]) --> P["parse · 读取任务编号"]
+    P -->|有编号| Q["query · 查任务"]
+    P -->|缺编号| A["ask_task_id · 暂停并等待人工补答"]
+    A -->|补答有效| Q
+    A -->|补答无效，更新追问| A
+    Q --> R["answer · 生成答复"]
+    R --> E([END])
+```
+
+恢复时 LangGraph 会从 `ask_task_id` 节点开头重新执行。此时 `interrupt` 返回用户补答，节点只负责校验和更新 State。查询放在后续的 `query` 节点，所以首次暂停和无效补答都不会触发业务调用。无效补答通过条件边重新进入追问节点，每次等待都需要调用端提供新的补答。[节点实现](../langgraph_learning/day5.py#L37) · [人工补答验证](https://docs.langchain.com/oss/python/langgraph/interrupts#validating-human-input)
+
+### 人工补参实现
+
+`ask_task_id(state)` 把追问交给 `interrupt`。恢复时把返回的补答交由 `_apply_task_id_reply` 生成状态更新。比如补答 `" 23456 "` 会写入 `task_id="23456"` 并清除原追问。无效补答会更新追问文案，条件边引导图再次暂停。[补参实现](../langgraph_learning/day5.py#L37)
+
+### 测试一、二 · 数据引用和直接查询
+
+用例复用 Day1 的 `12345` 和 `23456`。测试先核对任务编号与参考数据，再检查已给出编号时直接查询并生成答复。[用例数据](/media/xumaozhou/data/AI/local_agent_test/week11_langgraph/day5_cases.json) · [直接查询验收](../tests/test_week11_day5.py#L58)
+
+### 测试三、四 · 恢复位置和无效补答
+
+检查暂停快照的 `next` 是否指向 `ask_task_id`，再观察有效补答后的节点顺序 `ask_task_id → query → answer`。逐一发送空串、字母、全角数字和整数，验证图继续等待且查询次数保持为零。有效补答后查询一次。[恢复位置](../tests/test_week11_day5.py#L75) · [无效补答](../tests/test_week11_day5.py#L100)
+
+### 测试五 · 重新打开 SQLite 后恢复
+
+在第一次打开图时暂停并关闭连接。随后重新用同一个数据库文件编译图，读取待补参快照，再用同一线程的 `Command(resume=...)` 继续。测试确认原问题得以保留，查询恰好一次。SQLite 文件由 pytest 写入临时目录。[持久化恢复验收](../tests/test_week11_day5.py#L123)
+
+### 运行验收
+
+Day5 离线验收 **5 项通过**，覆盖恢复节点顺序、无效补答和 SQLite 重开后继续执行。Day1 至 Day5 离线回归共 **23 项通过**。
+
+在项目根目录运行。省略开关时只核对用例引用。
+
+```bash
+RUN_WEEK11_DAY5=1 .venv/bin/python -B -m pytest tests/test_week11_day5.py -v -p no:cacheprovider
 ```

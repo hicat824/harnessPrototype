@@ -37,6 +37,15 @@ def checkpoint_config(thread_id: str, checkpoint_id: str | None = None) -> Runna
 
 
 @contextmanager
+def open_task_checkpointer(db_path: str | Path) -> Iterator[SqliteSaver]:
+    """为任务查询图打开 SQLite Checkpointer，退出时关闭连接。"""
+    # 任务查询 State 包含 BusinessResult 实例，精确允许反序列化这一个业务类型。
+    serializer = JsonPlusSerializer(allowed_msgpack_modules=[("week6", "BusinessResult")])
+    with closing(sqlite3.connect(str(db_path), check_same_thread=False)) as connection:
+        yield SqliteSaver(connection, serde=serializer)
+
+
+@contextmanager
 def open_day4_graph(
     db_path: str | Path, query_task: Callable[[str], BusinessResult],
 ) -> Iterator[CompiledStateGraph]:
@@ -45,8 +54,5 @@ def open_day4_graph(
     调用方在 with 块内 invoke、get_state 或 get_state_history。以同一个
     SQLite 文件和 thread_id 重新打开图，可以读取此前保存的快照。
     """
-    # Day1 的 State 包含 BusinessResult 实例，精确允许反序列化这一个业务类型。
-    serializer = JsonPlusSerializer(allowed_msgpack_modules=[("week6", "BusinessResult")])
-    with closing(sqlite3.connect(str(db_path), check_same_thread=False)) as connection:
-        checkpointer = SqliteSaver(connection, serde=serializer)
+    with open_task_checkpointer(db_path) as checkpointer:
         yield build_day1_graph(query_task, checkpointer=checkpointer)
