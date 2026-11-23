@@ -1,6 +1,6 @@
 # Week11 · LangGraph 专项学习
 
-**当前进度**　Day1 至 Day5 已完成（2026-11-23），下一阶段为 Day6 工具副作用与恢复测试。本周用 Week6 的 Mock API 练习显式的只读查询工作流。[V4 学习计划](/home/xumaozhou/Music/agent_engineer_learning_plan_v4_mcp.md#L375)
+**当前进度**　Day1 至 Day6 已完成（2026-11-23），下一阶段为 Day7 框架对比与验收。本周用 Week6 的 Mock API 练习显式的只读查询工作流。[V4 学习计划](/home/xumaozhou/Music/agent_engineer_learning_plan_v4_mcp.md#L375)
 
 ## Day1 · State、节点与边
 
@@ -213,4 +213,51 @@ Day5 离线验收 **5 项通过**，覆盖恢复节点顺序、无效补答和 S
 
 ```bash
 RUN_WEEK11_DAY5=1 .venv/bin/python -B -m pytest tests/test_week11_day5.py -v -p no:cacheprovider
+```
+
+## Day6 · 工具副作用与恢复测试
+
+Day6 练习在一次工具调用之后暂停。图先核验权限并查询任务，把结果和缓存时间存入 SQLite，再暂停等待用户确认。调用端用同一个 `thread_id` 提交 `Command(resume=True)` 或 `Command(resume=False)`。同意后重新校验权限，通过后才决定使用刚才的结果还是补查。缓存时间 `cached_at` 由图的时钟记录，测试通过推进这个时钟来模拟等待时间。[图的实现](../langgraph_learning/day6.py#L61)
+
+恢复时，`review` 节点从开头重新执行，`interrupt` 返回本次提交的决定。首查放在已经完成的 `prefetch` 节点，正常恢复时不会重跑。需要更新数据时，图才经过 `refresh`，因此可以分别检查节点执行顺序和实际查询次数。[LangGraph Interrupts](https://docs.langchain.com/oss/python/langgraph/interrupts#side-effects-called-before-interrupt-must-be-idempotent)
+
+### 恢复动作与结果
+
+`decide_resume_action` 根据用户决定、当前读权限、缓存年龄和有效期选出恢复动作。图据此决定是否补查、是否生成答复，以及如何记录停止原因。比如查询后过了 10 秒且仍有权限，复用已有结果。在默认 60 秒有效期下，恰好过了 60 秒就补查一次。负年龄也补查，以处理时钟回拨。[恢复决策](../langgraph_learning/day6.py#L36)
+
+| 恢复时的条件 | 返回动作 | 图执行后的结果 |
+|---|---|---|
+| 用户拒绝 | `reject` | `cancelled / USER_REJECTED`，本次恢复不查权限、不查询 |
+| 用户同意，读权限已被撤销 | `forbidden` | `error / FORBIDDEN`，本次恢复不查询 |
+| 用户同意、有权限，且缓存仍有效 | `reuse` | 复用结果生成答复，累计查询 1 次 |
+| 用户同意、有权限，且缓存已到期或年龄为负 | `refresh` | 补查一次，成功后用新结果生成答复。补查失败时保留错误原因，清除当前 State 中的旧结果 |
+
+### 测试一 · 用例数据
+
+`day6_cases.json` 引用 Day1 的 `W11D1-01`，由 Week6 Mock API 提供任务 `12345` 初始状态 `RUNNING`。测试检查基准用例查询成功，以及 Day6 用例覆盖四种恢复动作和恰好到期的场景。[Day6 用例](/media/xumaozhou/data/AI/local_agent_test/week11_langgraph/day6_cases.json) · [数据检查](../tests/test_week11_day6.py#L31)
+
+### 测试二 · 恢复决策边界
+
+直接给恢复决策函数传入同意状态、权限和缓存年龄。依次核对拒绝、无权、刚查询、到期前、恰好到期和时钟回拨时应返回的动作。[决策测试](../tests/test_week11_day6.py#L42)
+
+### 测试三 · 恢复轨迹和工具次数
+
+逐个执行 `day6_cases.json` 的五个场景。首次运行查询一次并在 `review` 暂停。恢复后对比节点顺序、权限检查次数、查询次数和最终结果。状态变更场景中，过期后补查返回 `SUCCESS`，最终答复也要反映这份新结果。补查超时、权限撤销和拒绝场景都检查最终 State 中的查询结果与答复是否已清除。[轨迹测试](../tests/test_week11_day6.py#L68)
+
+### 测试四 · 首次权限拒绝
+
+使用 Day1 的任务编号，将首次权限校验设成拒绝，检查是否直接结束、保留 `FORBIDDEN` 且查询次数为零。[首次权限测试](../tests/test_week11_day6.py#L131)
+
+### 测试五 · 重新打开 SQLite 后复用结果
+
+首次查询使用 Day1 的 Mock API，暂停后关闭 SQLite。重新打开同一个数据库，使用同一个线程恢复。时钟只推进半个有效期，检查是否重新核验权限、从 SQLite 读取原有结果、生成预期答复，以及恢复时是否未再次查询。[持久化恢复测试](../tests/test_week11_day6.py#L147)
+
+### 运行验收
+
+Day6 离线验收 **5 项通过**，Day1 至 Day6 离线回归 **28 项通过**。
+
+在项目根目录运行。测试使用 Mock API 和 pytest 临时目录中的 SQLite。
+
+```bash
+RUN_WEEK11_DAY6=1 .venv/bin/python -B -m pytest tests/test_week11_day6.py -v -p no:cacheprovider
 ```
