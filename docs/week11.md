@@ -1,6 +1,6 @@
 # Week11 · LangGraph 专项学习
 
-**当前进度**　Day1 至 Day2 已完成（2026-11-23），下一阶段为 Day3 多节点失败处理与重试。本周用 Week6 的 Mock API 练习显式的只读查询工作流。[V4 学习计划](/home/xumaozhou/Music/agent_engineer_learning_plan_v4_mcp.md#L375)
+**当前进度**　Day1 至 Day3 已完成（2026-11-23），下一阶段为 Day4 Checkpointer、Thread 和持久化。本周用 Week6 的 Mock API 练习显式的只读查询工作流。[V4 学习计划](/home/xumaozhou/Music/agent_engineer_learning_plan_v4_mcp.md#L375)
 
 ## Day1 · State、节点与边
 
@@ -94,4 +94,43 @@ Day2 离线验收 **4 项通过**，其中图执行测试覆盖全部 **9 个场
 
 ```bash
 RUN_WEEK11_DAY2=1 .venv/bin/python -B -m pytest tests/test_week11_day2.py -v -p no:cacheprovider
+```
+
+## Day3 · 多节点失败处理与重试
+
+Day3 在 Day2 的查询和检索节点前加入预算检查。Week6 Service 已把 HTTP 超时和权限拒绝转换为 `BusinessResult.error_code`，因此图用条件边读取业务结果，决定是否再次进入 `query`。测试中的 API Client 每次只发起一次请求，便于将图中的查询次数和工具调用对齐。[Day3 图构建](../langgraph_learning/day3.py#L55)
+
+| 限制 | 默认值 | 到达上限后的行为 |
+|---|---:|---|
+| `max_query_attempts` | 2 | 包含首次查询。持续超时达到上限时保留 `TIMEOUT` 并结束。 |
+| `max_tool_calls` | 4 | 查询、重试和检索共享预算，失败调用也占一次。下一次工具调用被拦截时返回 `TOOL_BUDGET_EXHAUSTED`。 |
+| `max_steps` | 12 | 对应 LangGraph 的 `recursion_limit`，也覆盖选路和准备检索词等节点。图超步数时抛出 `GraphRecursionError`。 |
+
+`FORBIDDEN` 一次即结束。知识检索为空时沿用 Day2 的候选词回环，候选词用完后返回 `NO_KNOWLEDGE_EVIDENCE` 并保留已查到的事实。如果第一次查询超时后仍符合重试条件，却已经用完总预算，图会进入 `query` 节点并在发起工具调用前拦住。此时结束原因是 `TOOL_BUDGET_EXHAUSTED`，首次超时仍可在节点更新中看到。节点访问次数与真实工具次数可分别从节点更新和调用记录中核对。[LangGraph 超步限制](https://docs.langchain.com/oss/python/langgraph/graph-api#recursion-limit)
+
+### 重试与预算实现
+
+1. `should_retry_query(result, attempts, max_attempts)` 只在查询返回 `status="error"` 和 `error_code="TIMEOUT"`，并且已发起次数小于上限时返回 `True`。如首次超时且上限为 2，则允许再查一次。[查询重试判断](../langgraph_learning/day3.py#L34)
+2. `reserve_tool_call(used, limit)` 在仍有名额时返回下一次调用的累计数 `used + 1`，额度用完时返回 `None`。两个工具节点在调用前都使用这个返回值。[工具预算判断](../langgraph_learning/day3.py#L45)
+
+### 测试一 · 数据与 Mock 核对
+
+用例包含九题，引用 Week9 的 `KB006.md`。测试先单独核对 Week6 的正常任务、持续超时和权限拒绝。首查超时后恢复的题使用固定的超时结果，再交给 Week6 Mock 查询真实用例状态。[Day3 用例数据](/media/xumaozhou/data/AI/local_agent_test/week11_langgraph/day3_cases.json) · [Mock 核对](../tests/test_week11_day3.py#L39)
+
+### 测试二、三 · 重试判断与工具预算
+
+用固定的 `BusinessResult` 和计数核对超时是否仍能重试，并检查零预算、剩余一次和已耗尽这些边界。[重试测试](../tests/test_week11_day3.py#L51) · [预算测试](../tests/test_week11_day3.py#L65)
+
+### 测试四、五 · 图的执行轨迹与步数上限
+
+逐题核对节点顺序、实际工具次数、每次查询的错误码和最终停止原因。步数测试另将步数上限设为 2，在有工具预算时确认图仍会触发 `GraphRecursionError`。[执行轨迹](../tests/test_week11_day3.py#L74) · [步数上限](../tests/test_week11_day3.py#L118)
+
+### 运行验收
+
+Day3 离线验收 **5 项通过**，图执行覆盖全部 **9 个场景**。Day1 至 Day3 回归共 **13 项通过**。
+
+在项目根目录运行。省略开关时只运行数据核对，数据目录仍可通过 `WEEK11_DATASET` 和 `WEEK9_RAG_DATASET` 指定。
+
+```bash
+RUN_WEEK11_DAY3=1 .venv/bin/python -B -m pytest tests/test_week11_day3.py -v -p no:cacheprovider
 ```
