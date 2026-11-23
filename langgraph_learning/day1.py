@@ -4,6 +4,7 @@ import re
 from collections.abc import Callable
 from typing import TypedDict
 
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from typing_extensions import NotRequired
@@ -44,11 +45,15 @@ def answer_task(state: TaskQueryState) -> dict[str, str]:
     return {"answer": f"无法确认任务 {task_id} 的当前状态（{reason}）。"}
 
 
-def build_day1_graph(query_task: Callable[[str], BusinessResult]) -> CompiledStateGraph:
+def build_day1_graph(
+    query_task: Callable[[str], BusinessResult],
+    *,
+    checkpointer: BaseCheckpointSaver | None = None,
+) -> CompiledStateGraph:
     """构建并返回可用 invoke 和 stream 运行的 Day1 状态图。
 
     query_task 由调用方提供，接收 parse 提取的编号并返回 Week6 BusinessResult。
-    测试会注入 Mock 业务查询。图内部只负责调用顺序和 State 更新。
+    测试会注入 Mock 业务查询。Day4 可以传入 checkpointer 保存线程状态快照。
 
     图按 START → parse → query → answer → END 执行。
     每个节点返回自己新增或更新的字段，LangGraph 会把这些字段合并进该次运行的 State。
@@ -65,5 +70,5 @@ def build_day1_graph(query_task: Callable[[str], BusinessResult]) -> CompiledSta
     builder.add_edge("parse", "query")
     builder.add_edge("query", "answer")
     builder.add_edge("answer", END)
-    graph = builder.compile()
+    graph = builder.compile(checkpointer=checkpointer)
     return graph

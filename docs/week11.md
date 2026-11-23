@@ -1,6 +1,6 @@
 # Week11 · LangGraph 专项学习
 
-**当前进度**　Day1 至 Day3 已完成（2026-11-23），下一阶段为 Day4 Checkpointer、Thread 和持久化。本周用 Week6 的 Mock API 练习显式的只读查询工作流。[V4 学习计划](/home/xumaozhou/Music/agent_engineer_learning_plan_v4_mcp.md#L375)
+**当前进度**　Day1 至 Day4 已完成（2026-11-23），下一阶段为 Day5 Interrupt / Resume 与 Human-in-the-loop。本周用 Week6 的 Mock API 练习显式的只读查询工作流。[V4 学习计划](/home/xumaozhou/Music/agent_engineer_learning_plan_v4_mcp.md#L375)
 
 ## Day1 · State、节点与边
 
@@ -24,7 +24,7 @@ Agents SDK 的 Session 用于保存和读取跨轮消息历史。Day1 的 LangGr
 
 ### 状态图实现
 
-`build_day1_graph(query_task)` 注册三个节点、连接四条边并返回编译后的图。调用方提供的 `query_task` 接收任务编号并返回 Week6 的 `BusinessResult`。使用 `graph.invoke({"question": ...})` 获取合并后的最终 State，使用 `graph.stream(..., stream_mode="updates")` 查看各节点分别写入的字段。[代码入口](../langgraph_learning/day1.py#L47) · [LangGraph Streaming](https://docs.langchain.com/oss/python/langgraph/streaming)
+`build_day1_graph(query_task)` 注册三个节点、连接四条边并返回编译后的图。调用方提供的 `query_task` 接收任务编号并返回 Week6 的 `BusinessResult`。使用 `graph.invoke({"question": ...})` 获取合并后的最终 State，使用 `graph.stream(..., stream_mode="updates")` 查看各节点分别写入的字段。[代码入口](../langgraph_learning/day1.py#L48) · [LangGraph Streaming](https://docs.langchain.com/oss/python/langgraph/streaming)
 
 ### 测试数据与验收
 
@@ -133,4 +133,41 @@ Day3 离线验收 **5 项通过**，图执行覆盖全部 **9 个场景**。Day1
 
 ```bash
 RUN_WEEK11_DAY3=1 .venv/bin/python -B -m pytest tests/test_week11_day3.py -v -p no:cacheprovider
+```
+
+## Day4 · Checkpointer、Thread 和持久化
+
+Day4 给已经完成的 Day1 查询图接入 SQLite Checkpointer。仍然走 `parse → query → answer`，执行期间自动保存各阶段的 State。比如在同一线程先查任务 `12345`，再查任务 `23456`。读取最新快照会得到第二个任务，读取第一个任务对应的 `checkpoint_id` 可以看到当时保存的状态。查看快照只访问数据库，业务 API 调用发生在 `invoke` 执行图时。[Day4 代码](../langgraph_learning/day4.py#L40) · [LangGraph Checkpointers](https://docs.langchain.com/oss/python/langgraph/checkpointers)
+
+| 概念 | 在 Day4 中的作用 |
+|---|---|
+| `thread_id` | 标识一组有关联的图运行。如用同一线程执行两次查询，两次执行的快照都可从该线程查出。 |
+| `checkpoint_id` | 定位该线程历史中的某一份快照。省略时 `get_state` 读取最新快照。 |
+| `StateSnapshot` | `values` 保存业务字段，`next` 记录接下来待执行的节点。执行结束时 `next` 是空元组。可以用 `get_state_history` 依次检查这些快照。 |
+| 模型 Context | 一次模型请求实际携带的消息和证据。Day4 的查询图用固定答复，快照保存的是原问题、任务编号、查询结果和答复。接入模型时由调用方挑选本次请求需要的 State 字段。 |
+
+### 线程与快照配置
+
+`checkpoint_config(thread_id, checkpoint_id)` 返回的配置可直接传给图的 `invoke`、`get_state` 或 `get_state_history`。`configurable.thread_id` 始终提供。读取最新快照时省略 `checkpoint_id`，读取指定历史快照时在 `configurable` 中加入该字段。[配置实现](../langgraph_learning/day4.py#L17)
+
+### 测试一、二 · 用例引用和配置结构
+
+`day4_cases.json` 引用 Day1 的三道查询用例，指定两个有历史的线程和一个未使用的线程。测试核对引用和线程分组，并检查最新快照和指定快照所需的两种配置结构。[Day4 用例数据](/media/xumaozhou/data/AI/local_agent_test/week11_langgraph/day4_cases.json) · [配置验收](../tests/test_week11_day4.py#L44)
+
+### 测试三、四 · 历史快照与线程隔离
+
+对线程 A 连续运行两个不同任务，从历史中核对已结束快照的顺序，并读取第一次运行保存的快照。隔离测试让两个线程写入同一个数据库，分别读取自己的结果，未使用的线程返回空 State。[历史验收](../tests/test_week11_day4.py#L68) · [隔离验收](../tests/test_week11_day4.py#L99)
+
+### 测试五 · 进程退出后回读
+
+子进程用项目的 Python 运行一次 Mock 查询并关闭 SQLite。子进程退出后，pytest 进程重新打开数据库，按同一个 `thread_id` 读取结果。测试还核对 `query_result` 仍是 `BusinessResult`，且回读时工具调用次数为零。SQLite 文件由 pytest 写到临时目录。[持久化验收](../tests/test_week11_day4.py#L120)
+
+### 运行验收
+
+Day4 离线验收 **5 项通过**，包括历史快照、线程隔离和跨进程回读。Day1 至 Day4 回归共 **18 项通过**。
+
+主项目 `.venv` 已安装 `langgraph-checkpoint-sqlite`。在新环境中可用项目 Python 安装 Week11 依赖。在项目根目录运行下列命令，省略开关时只核对用例引用。[Week11 依赖](../langgraph_learning/requirements.txt)
+
+```bash
+RUN_WEEK11_DAY4=1 .venv/bin/python -B -m pytest tests/test_week11_day4.py -v -p no:cacheprovider
 ```
