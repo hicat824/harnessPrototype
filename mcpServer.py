@@ -9,6 +9,7 @@ from mcp.server import MCPServer
 mcp = MCPServer("csktsTools")
 
 _CS_KTS_URL = "http://cs-kts.gzproduction.com/cs-kts"
+_RELATION_REQUIRED_KEYS = ("lpSrc", "csKtsTaskId", "osmTaskId", "labelTaskId")
 
 
 def _parse_positive_int(name: str, value: str) -> int:
@@ -42,6 +43,25 @@ def _query_task_tags(url: str, identifier: str) -> dict:
     except HttpRequestError as exc:
         raise ToolError(f"failed to query task info for {identifier}: {exc}") from exc
     return _extract_task_tags(response, identifier)
+
+
+def _query_label_platform_relation(url: str, identifier: str) -> dict:
+    try:
+        response = httpReqWithJsonResp(url)
+    except HttpRequestError as exc:
+        raise ToolError(
+            f"failed to query label platform relation for {identifier}: {exc}"
+        ) from exc
+    if not isinstance(response, dict):
+        raise ToolError(
+            f"label platform relation is invalid for {identifier}: {response!r}"
+        )
+    missing = [key for key in _RELATION_REQUIRED_KEYS if key not in response]
+    if missing:
+        raise ToolError(
+            f"label platform relation missing fields {missing} for {identifier}: {response!r}"
+        )
+    return response
 
 
 @mcp.tool()
@@ -79,6 +99,28 @@ def csKtsShowByTaskId(
     query = urlencode({"id": parsed_id})
     url = f"{_CS_KTS_URL}/task/show?{query}"
     return _query_task_tags(url, f"task_id={parsed_id}")
+
+
+@mcp.tool()
+def csKtsFindRelationByCsKtsTaskId(
+    task_id: Annotated[
+        str,
+        Field(description="4dBEV 导入流程任务 taskId，全数字，例如 440448"),
+    ],
+) -> dict:
+    """
+    通过 4dBEV 导入流程任务 taskId 查询标注平台任务关联关系。
+
+    返回字段：
+    - lpSrc：标注平台任务类型 labelplatformSource
+    - csKtsTaskId：导入流程任务 id
+    - osmTaskId：矢量数据对应任务 id
+    - labelTaskId：标注平台任务 id
+    """
+    parsed_id = _parse_task_id(task_id)
+    query = urlencode({"csKtsTaskId": parsed_id})
+    url = f"{_CS_KTS_URL}/labelPlatform/findRelationByCsKtsTaskId?{query}"
+    return _query_label_platform_relation(url, f"csKtsTaskId={parsed_id}")
 
 
 if __name__ == '__main__':
